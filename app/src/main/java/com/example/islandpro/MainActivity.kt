@@ -31,6 +31,7 @@ class MainActivity : Activity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var statusText: TextView
     private lateinit var permText: TextView
+    private lateinit var musicStatus: TextView
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -68,6 +69,33 @@ class MainActivity : Activity() {
         }, buttonParams())
         statusCard.addView(row)
         root.addView(statusCard)
+
+        // Music card
+        val musicCard = card()
+        musicCard.addView(label("Music", 18f, textMain, true))
+        musicStatus = label("", 14f, textDim, false).apply { setPadding(0, dp(4), 0, 0) }
+        musicCard.addView(musicStatus)
+        musicCard.addView(
+            label(
+                "Needed to show album art and controls. If the switch is blocked, " +
+                    "open App info, tap the three-dot menu and choose Allow restricted settings.",
+                12f, textDim, false
+            ).apply { setPadding(0, dp(6), 0, dp(10)) }
+        )
+        val musicRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        musicRow.addView(actionButton("Grant access", true) {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }, buttonParams())
+        musicRow.addView(actionButton("App info", false) {
+            startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        }, buttonParams())
+        musicCard.addView(musicRow)
+        root.addView(musicCard)
 
         // Size card
         val sizeCard = card()
@@ -115,6 +143,15 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         refresh()
+        if (IslandService.running && !IslandService.mediaReady && listenerEnabled()) {
+            startForegroundService(Intent(this, IslandService::class.java))
+        }
+    }
+
+    private fun listenerEnabled(): Boolean {
+        val flat = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+            ?: return false
+        return flat.contains(packageName)
     }
 
     private fun refresh() {
@@ -129,6 +166,11 @@ class MainActivity : Activity() {
             "Overlay permission: Granted"
         } else {
             "Overlay permission: Not granted (tap Start to grant)"
+        }
+        musicStatus.text = if (listenerEnabled()) {
+            "Music access: Granted"
+        } else {
+            "Music access: Not granted"
         }
     }
 
