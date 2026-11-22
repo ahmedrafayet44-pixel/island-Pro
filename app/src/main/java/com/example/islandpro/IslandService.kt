@@ -5,6 +5,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -14,7 +15,9 @@ import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.BatteryManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -31,6 +34,7 @@ class IslandService : Service() {
         @Volatile
         var running = false
         private const val CHANNEL_ID = "island_channel"
+        private const val AUTO_COLLAPSE_MS = 4000L
     }
 
     private var wm: WindowManager? = null
@@ -45,7 +49,48 @@ class IslandService : Service() {
     private var bigH = 0
     private var frac = 0f
 
+    private var charging = false
+    private val handler = Handler(Looper.getMainLooper())
+    private val collapseRunnable = Runnable { animateTo(0f) }
+
+    private val receiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_POWER_CONNECTED -> {
+                    charging = true
+                    animateTo(1f)
+                    scheduleCollapse()
+                }
+                Intent.ACTION_POWER_DISCONNECTED -> {
+                    charging = false
+                    animateTo(1f)
+                    scheduleCollapse()
+                }
+                Intent.ACTION_BATTERY_CHANGED -> {
+                    if (label?.visibility == View.VISIBLE) showInfo()
+                }
+            }
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        val sticky = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        charging = (sticky?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0
+
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_POWER_CONNECTED)
+            addAction(Intent.ACTION_POWER_DISCONNECTED)
+            addAction(Intent.ACTION_BATTERY_CHANGED)
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(receiver, filter)
+        }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startAsForeground()
@@ -125,7 +170,17 @@ class IslandService : Service() {
     }
 
     private fun toggle() {
-        val target = if (frac < 0.5f) 1f else 0f
+        handler.removeCallbacks(collapseRunnable)
+        animateTo(if (frac < 0.5f) 1f else 0f)
+    }
+
+    private fun scheduleCollapse() {
+        handler.removeCallbacks(collapseRunnable)
+        handler.postDelayed(collapseRunnable, AUTO_COLLAPSE_MS)
+    }
+
+    private fun animateTo(target: Float) {
+        if (box == null || params == null) return
         animator?.cancel()
         animator = ValueAnimator.ofFloat(frac, target).apply {
             duration = 350
@@ -137,7 +192,11 @@ class IslandService : Service() {
                 lp.height = (smallH + (bigH - smallH) * frac).toInt()
                 val v = box ?: return@addUpdateListener
                 if (v.isAttachedToWindow) wm?.updateViewLayout(v, lp)
-                if (frac > 0.6f) showInfo() else label?.visibility = View.GONE
+                if (frac > 0.6f) {
+                    if (label?.visibility != View.VISIBLE) showInfo()
+                } else {
+                    label?.visibility = View.GONE
+                }
             }
             start()
         }
@@ -146,12 +205,17 @@ class IslandService : Service() {
     private fun showInfo() {
         val bat = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = bat?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-        val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
-        label?.text = "🔋 $level%   •   $time"
+        label?.text = if (charging) {
+            "⚡ চার্জ হচ্ছে   $level%"
+        } else {
+            val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+            "🔋 $level%   •   $time"
+        }
         label?.visibility = View.VISIBLE
     }
 
     private fun removePill() {
+        handler.removeCallbacks(collapseRunnable)
         animator?.cancel()
         box?.let {
             if (it.isAttachedToWindow) wm?.removeView(it)
@@ -161,6 +225,10 @@ class IslandService : Service() {
 
     override fun onDestroy() {
         removePill()
+        try {
+            unregisterReceiver(receiver)
+        } catch (e: Exception) {
+        }
         running = false
         super.onDestroy()
     }
