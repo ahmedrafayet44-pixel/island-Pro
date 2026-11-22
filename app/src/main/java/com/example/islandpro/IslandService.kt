@@ -1,10 +1,12 @@
 package com.example.islandpro
 
+import android.animation.TimeInterpolator
 import android.animation.ValueAnimator
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.RemoteInput
 import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.ComponentName
@@ -21,6 +23,7 @@ import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.media.MediaMetadata
 import android.media.session.MediaController
@@ -28,19 +31,27 @@ import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.BatteryManager
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewOutlineProvider
 import android.view.WindowManager
+import android.view.animation.AccelerateDecelerateInterpolator
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.LinearInterpolator
 import android.view.animation.OvershootInterpolator
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -50,6 +61,18 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.sin
+
+internal class NotifItem(
+    val key: String,
+    val pkg: String,
+    val appName: String,
+    val icon: Bitmap?,
+    val title: String,
+    val text: String,
+    val time: Long,
+    val contentIntent: PendingIntent?,
+    val replyAction: Notification.Action?
+)
 
 class IslandService : Service() {
 
@@ -63,14 +86,15 @@ class IslandService : Service() {
         @Volatile
         var instance: IslandService? = null
         private const val CHANNEL_ID = "island_channel"
-        private const val AUTO_COLLAPSE_MS = 3500L
-        private const val NOTIF_COLLAPSE_MS = 4000L
-        private const val TAP_COLLAPSE_MS = 1300L
+
+        // Time the panel stays open before it shrinks (milliseconds)
+        private const val COLLAPSE_DELAY_MS = 1300L
+        private const val ANIM_MS = 350L
+        private const val CHARGE_COLLAPSE_MS = 3500L
         private const val EVENT_NONE = 0
         private const val EVENT_PLUG = 1
         private const val EVENT_UNPLUG = 2
-        private const val EVENT_MUSIC = 3
-        private const val EVENT_NOTIF = 4
+        private const val EVENT_PAGE = 3
     }
 
     private var wm: WindowManager? = null
@@ -96,8 +120,13 @@ class IslandService : Service() {
     private var notifApp: TextView? = null
     private var notifTitle: TextView? = null
     private var notifText: TextView? = null
+    private var notifBtnRow: LinearLayout? = null
+    private var notifInputRow: LinearLayout? = null
+    private var notifInput: EditText? = null
+    private var strip: LinearLayout? = null
     private var params: WindowManager.LayoutParams? = null
     private var animator: ValueAnimator? = null
+    private var heightAnim: ValueAnimator? = null
 
     private var smallW = 0
     private var smallH = 0
@@ -111,9 +140,15 @@ class IslandService : Service() {
     private var event = EVENT_NONE
     private var chargeShown = false
 
-    private var notifIntent: PendingIntent? = null
-    private var notifPkg: String? = null
+    private var curPage = 0
+    private var replyMode = false
+    private var downX = 0f
+    private var downY = 0f
+    private var downOnStrip = false
+
+    private val notifs = ArrayList<NotifItem>()
     private val seen = HashMap<String, Int>()
+    private val selfCancelled = HashSet<String>()
 
     private var msm: MediaSessionManager? = null
     private var controller: MediaController? = null
@@ -191,6 +226,7 @@ class IslandService : Service() {
         running = true
         buildPill()
         setupMedia()
+        applyPopupSetting()
         return START_STICKY
     }
 
@@ -210,25 +246,67 @@ class IslandService : Service() {
         }
     }
 
+    private fun applyPopupSetting() {
+        val prefs = getSharedPreferences("island", Context.MODE_PRIVATE)
+        val ctx = applicationContext
+        if (prefs.getBoolean("hide_popups", true)) {
+            Thread { ShizukuHelper.setHeadsUp(ctx, false) }.start()
+        } else if (prefs.getBoolean("headsup_off", false)) {
+            Thread { ShizukuHelper.setHeadsUp(ctx, true) }.start()
+        }
+    }
+
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun collapseDelay(): Long = COLLAPSE_DELAY_MS + ANIM_MS
 
     private fun batteryLevel(): Int {
         val bat = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         return bat?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
     }
 
+    private fun drawableToBitmap(d: Drawable, size: Int): Bitmap {
+        val b = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val c = Canvas(b)
+        d.setBounds(0, 0, size, size)
+        d.draw(c)
+        return b
+    }
+
+    private fun appIcon(pkg: String): Bitmap? {
+        return try {
+            drawableToBitmap(packageManager.getApplicationIcon(pkg), dp(48))
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     // ---------- Notifications ----------
 
-    fun onNotification(sbn: StatusBarNotification) {
-        if (box == null) return
+    private fun findReplyAction(n: Notification): Notification.Action? {
+        val acts = n.actions ?: return null
+        for (a in acts) {
+            val ris = a.remoteInputs ?: continue
+            for (ri in ris) {
+                if (ri.allowFreeFormInput) return a
+            }
+        }
+        return null
+    }
+
+    fun onNotification(sbn: StatusBarNotification, listener: NotificationListenerService) {
         if (sbn.packageName == packageName) return
         val n = sbn.notification ?: return
         if ((n.flags and Notification.FLAG_ONGOING_EVENT) != 0) return
         if ((n.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
+        if (n.fullScreenIntent != null) return
         val cat = n.category
         if (cat == Notification.CATEGORY_TRANSPORT ||
             cat == Notification.CATEGORY_PROGRESS ||
-            cat == Notification.CATEGORY_SERVICE
+            cat == Notification.CATEGORY_SERVICE ||
+            cat == Notification.CATEGORY_CALL ||
+            cat == Notification.CATEGORY_ALARM ||
+            cat == Notification.CATEGORY_NAVIGATION
         ) return
 
         val ex = n.extras ?: return
@@ -240,13 +318,22 @@ class IslandService : Service() {
             ?: ex.getCharSequence(Notification.EXTRA_TEXT))?.toString() ?: ""
         if (title.isEmpty() && text.isEmpty()) return
 
+        // Optional fallback: remove it from the phone's shade
+        val prefs = getSharedPreferences("island", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("hide_sys", false)) {
+            if (selfCancelled.size > 200) selfCancelled.clear()
+            selfCancelled.add(sbn.key)
+            try {
+                listener.cancelNotification(sbn.key)
+            } catch (e: Exception) {
+                selfCancelled.remove(sbn.key)
+            }
+        }
+
         val sig = title.hashCode() * 31 + text.hashCode()
         if (seen[sbn.key] == sig) return
         if (seen.size > 100) seen.clear()
         seen[sbn.key] = sig
-
-        // Do not interrupt a charging animation that is on screen
-        if ((event == EVENT_PLUG || event == EVENT_UNPLUG) && targetFrac == 1f) return
 
         val pm = packageManager
         val appName = try {
@@ -254,31 +341,57 @@ class IslandService : Service() {
         } catch (e: Exception) {
             sbn.packageName
         }
-        val icon = try {
-            pm.getApplicationIcon(sbn.packageName)
-        } catch (e: Exception) {
-            null
-        }
 
-        notifPkg = sbn.packageName
-        notifIntent = n.contentIntent
-        notifApp?.text = appName
-        notifTitle?.text = title
-        notifText?.text = text
-        notifIcon?.setImageDrawable(icon)
-        startEvent(EVENT_NOTIF)
+        val item = NotifItem(
+            sbn.key,
+            sbn.packageName,
+            appName,
+            appIcon(sbn.packageName),
+            title,
+            text,
+            sbn.postTime,
+            n.contentIntent,
+            findReplyAction(n)
+        )
+        notifs.removeAll { it.key == item.key }
+        notifs.add(0, item)
+        while (notifs.size > 15) notifs.removeAt(notifs.size - 1)
+
+        if (box == null) return
+        if (replyMode) {
+            renderPage()
+            renderContent()
+            return
+        }
+        if ((event == EVENT_PLUG || event == EVENT_UNPLUG) && targetFrac == 1f) {
+            renderPage()
+            return
+        }
+        showPages(if (hasMusic()) 1 else 0)
     }
 
-    private fun openNotification() {
-        val pi = notifIntent
+    fun onNotificationRemoved(sbn: StatusBarNotification) {
+        seen.remove(sbn.key)
+        if (selfCancelled.remove(sbn.key)) return
+        val removed = notifs.removeAll { it.key == sbn.key }
+        if (removed && box != null) {
+            renderPage()
+            renderContent()
+        }
+    }
+
+    private fun openItem(item: NotifItem) {
+        var ok = false
+        val pi = item.contentIntent
         if (pi != null) {
             try {
                 pi.send()
-                return
+                ok = true
             } catch (e: Exception) {
             }
         }
-        launchApp(notifPkg)
+        if (!ok) launchApp(item.pkg)
+        notifs.remove(item)
     }
 
     private fun launchApp(pkg: String?) {
@@ -289,6 +402,86 @@ class IslandService : Service() {
             startActivity(i)
         } catch (e: Exception) {
         }
+    }
+
+    private fun openMusicApp() {
+        val c = controller ?: return
+        val pi = c.sessionActivity
+        if (pi != null) {
+            try {
+                pi.send()
+                return
+            } catch (e: Exception) {
+            }
+        }
+        launchApp(c.packageName)
+    }
+
+    // ---------- Reply ----------
+
+    private fun setFocusable(on: Boolean) {
+        val lp = params ?: return
+        lp.flags = if (on) {
+            lp.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+        } else {
+            lp.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        }
+        val v = box ?: return
+        if (v.isAttachedToWindow) wm?.updateViewLayout(v, lp)
+    }
+
+    private fun startReply() {
+        val item = pageNotif(curPage) ?: return
+        if (item.replyAction == null) return
+        replyMode = true
+        handler.removeCallbacks(collapseRunnable)
+        notifBtnRow?.visibility = View.GONE
+        notifInputRow?.visibility = View.VISIBLE
+        notifInput?.setText("")
+        setFocusable(true)
+        notifInput?.requestFocus()
+        handler.postDelayed({
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            val inp = notifInput
+            if (inp != null) imm.showSoftInput(inp, 0)
+        }, 250)
+    }
+
+    private fun exitReply() {
+        if (!replyMode) return
+        replyMode = false
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        val tok = notifInput?.windowToken
+        if (tok != null) imm.hideSoftInputFromWindow(tok, 0)
+        notifInput?.clearFocus()
+        notifInputRow?.visibility = View.GONE
+        setFocusable(false)
+        val item = pageNotif(curPage)
+        notifBtnRow?.visibility =
+            if (item?.replyAction != null) View.VISIBLE else View.GONE
+    }
+
+    private fun sendReply(item: NotifItem, text: String) {
+        val a = item.replyAction ?: return
+        val ris = a.remoteInputs ?: return
+        val intent = Intent()
+        val results = Bundle()
+        for (ri in ris) results.putCharSequence(ri.resultKey, text)
+        RemoteInput.addResultsToIntent(ris, intent, results)
+        try {
+            a.actionIntent.send(this, 0, intent)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun submitReply() {
+        val item = pageNotif(curPage) ?: return
+        val txt = notifInput?.text?.toString()?.trim() ?: ""
+        if (txt.isEmpty()) return
+        sendReply(item, txt)
+        notifs.remove(item)
+        animateTo(0f)
+        renderPage()
     }
 
     // ---------- Media ----------
@@ -352,6 +545,99 @@ class IslandService : Service() {
         renderContent()
     }
 
+    // ---------- Pages ----------
+
+    private fun pageCount(): Int = (if (hasMusic()) 1 else 0) + notifs.size
+
+    private fun pageIsMusic(p: Int): Boolean = hasMusic() && p == 0
+
+    private fun pageNotif(p: Int): NotifItem? {
+        val i = if (hasMusic()) p - 1 else p
+        return notifs.getOrNull(i)
+    }
+
+    private fun pageHeight(): Int {
+        val extra = if (notifs.isNotEmpty()) dp(18) else 0
+        if (pageIsMusic(curPage)) return dp(124) + extra
+        val item = pageNotif(curPage)
+        return (if (item?.replyAction != null) dp(112) else dp(84)) + extra
+    }
+
+    private fun bindNotif(item: NotifItem) {
+        val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(item.time))
+        notifApp?.text = "${item.appName}  •  $time"
+        notifTitle?.text = item.title
+        notifText?.text = item.text
+        notifIcon?.setImageBitmap(item.icon)
+        val canReply = item.replyAction != null && !replyMode
+        notifBtnRow?.visibility = if (canReply) View.VISIBLE else View.GONE
+    }
+
+    private fun renderPage() {
+        val count = pageCount()
+        curPage = curPage.coerceIn(0, maxOf(0, count - 1))
+        val item = pageNotif(curPage)
+        if (item != null) bindNotif(item)
+        val extra = if (notifs.isNotEmpty()) dp(18) else 0
+        musicCard?.setPadding(dp(18), dp(8), dp(18), dp(8) + extra)
+        notifRow?.setPadding(dp(16), dp(8), dp(16), dp(8) + extra)
+        buildStrip()
+    }
+
+    private fun buildStrip() {
+        val s = strip ?: return
+        s.removeAllViews()
+        val pkgs = LinkedHashSet<String>()
+        for (it in notifs) pkgs.add(it.pkg)
+        if (pkgs.isEmpty()) {
+            s.visibility = View.GONE
+            return
+        }
+        val curPkg = pageNotif(curPage)?.pkg
+        var n = 0
+        for (p in pkgs) {
+            if (n >= 7) break
+            val item = notifs.first { it.pkg == p }
+            val cur = p == curPkg
+            val iv = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                clipToOutline = true
+                outlineProvider = roundOutline(0.28f)
+                alpha = if (cur) 1f else 0.5f
+            }
+            val bmp = item.icon
+            if (bmp != null) {
+                iv.setImageBitmap(bmp)
+            } else {
+                iv.setBackgroundColor(Color.parseColor("#6A5CFF"))
+            }
+            val size = if (cur) dp(16) else dp(13)
+            s.addView(
+                iv,
+                LinearLayout.LayoutParams(size, size).apply {
+                    marginStart = dp(3)
+                    marginEnd = dp(3)
+                }
+            )
+            n++
+        }
+    }
+
+    private fun changePage(dir: Int) {
+        if (pageCount() < 2) return
+        val np = curPage + dir
+        if (np < 0 || np >= pageCount()) return
+        if (replyMode) exitReply()
+        curPage = np
+        renderPage()
+        animateHeightTo(pageHeight())
+        renderContent()
+        val v: View? = if (pageIsMusic(curPage)) musicCard else notifRow
+        v?.translationX = (dir * dp(48)).toFloat()
+        v?.alpha = 0f
+        v?.animate()?.translationX(0f)?.alpha(1f)?.setDuration(200)?.start()
+    }
+
     // ---------- Pill ----------
 
     private fun roundOutline(ratio: Float): ViewOutlineProvider {
@@ -378,7 +664,7 @@ class IslandService : Service() {
         return MediaButton(this, kind).apply {
             setOnClickListener {
                 onClick()
-                scheduleCollapse(TAP_COLLAPSE_MS)
+                scheduleCollapse(collapseDelay())
             }
         }
     }
@@ -390,6 +676,22 @@ class IslandService : Service() {
             if (bold) setTypeface(typeface, Typeface.BOLD)
             setSingleLine(true)
             ellipsize = TextUtils.TruncateAt.END
+        }
+    }
+
+    private fun pillButton(text: String, onClick: () -> Unit): TextView {
+        return TextView(this).apply {
+            this.text = text
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            setTypeface(typeface, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setPadding(dp(18), 0, dp(18), 0)
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#33FFFFFF"))
+                cornerRadius = dp(18).toFloat()
+            }
+            setOnClickListener { onClick() }
         }
     }
 
@@ -407,6 +709,7 @@ class IslandService : Service() {
         cornerPx = smallH / 2f
         event = EVENT_NONE
         chargeShown = false
+        replyMode = false
 
         // Album art as card background (with a dark scrim on top)
         val bArt = ImageView(this).apply {
@@ -466,7 +769,7 @@ class IslandService : Service() {
         }
         chargeRow = cRow
 
-        // Notification row
+        // Notification card
         val nIcon = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
             clipToOutline = true
@@ -485,17 +788,96 @@ class IslandService : Service() {
             addView(nTitle)
             addView(nText)
         }
-        val nRow = LinearLayout(this).apply {
+        val nTop = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(8), dp(16), dp(8))
-            visibility = View.GONE
-            addView(nIcon, LinearLayout.LayoutParams(dp(46), dp(46)))
+            addView(nIcon, LinearLayout.LayoutParams(dp(42), dp(42)))
             addView(
                 nCol,
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                     marginStart = dp(12)
                 }
+            )
+        }
+        val replyBtn = pillButton("Reply") { startReply() }
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.START
+            visibility = View.GONE
+            addView(replyBtn, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(34)))
+        }
+        notifBtnRow = btnRow
+        val input = EditText(this).apply {
+            hint = "Reply…"
+            setHintTextColor(Color.parseColor("#80FFFFFF"))
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            setSingleLine(true)
+            gravity = Gravity.CENTER_VERTICAL
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            imeOptions = EditorInfo.IME_ACTION_SEND
+            setPadding(dp(14), 0, dp(14), 0)
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#26FFFFFF"))
+                cornerRadius = dp(19).toFloat()
+            }
+            setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_SEND) {
+                    submitReply()
+                    true
+                } else {
+                    false
+                }
+            }
+            setOnKeyListener { _, keyCode, e ->
+                if (keyCode == KeyEvent.KEYCODE_BACK && e.action == KeyEvent.ACTION_UP) {
+                    animateTo(0f)
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+        notifInput = input
+        val sendBtn = pillButton("Send") { submitReply() }
+        val inputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            addView(input, LinearLayout.LayoutParams(0, dp(38), 1f))
+            addView(
+                sendBtn,
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(38)).apply {
+                    marginStart = dp(8)
+                }
+            )
+        }
+        notifInputRow = inputRow
+        val nRow = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            visibility = View.GONE
+            addView(
+                nTop,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+            addView(
+                btnRow,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(8) }
+            )
+            addView(
+                inputRow,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(8) }
             )
         }
         notifRow = nRow
@@ -582,6 +964,14 @@ class IslandService : Service() {
         val cEq = EqView(this).apply { visibility = View.GONE }
         compactEq = cEq
 
+        // Bottom strip of small app icons (display only)
+        val stripView = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+        }
+        strip = stripView
+
         val shape = GradientDrawable().apply {
             setColor(Color.BLACK)
             cornerRadius = cornerPx
@@ -611,11 +1001,15 @@ class IslandService : Service() {
                     dp(24), eqH, Gravity.END or Gravity.CENTER_VERTICAL
                 ).apply { marginEnd = dp(12) }
             )
-            setOnClickListener { onPillClick() }
-            setOnTouchListener { _, ev ->
-                onOutsideTouch(ev)
-                false
-            }
+            addView(
+                stripView,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    dp(18),
+                    Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                ).apply { bottomMargin = dp(4) }
+            )
+            setOnTouchListener { _, ev -> onPillTouch(ev) }
         }
         box = b
 
@@ -631,6 +1025,7 @@ class IslandService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
             x = offsetX
             y = top
         }
@@ -639,44 +1034,110 @@ class IslandService : Service() {
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         wm?.addView(b, lp)
 
+        renderPage()
         refreshMusicViews()
     }
 
-    private fun onOutsideTouch(ev: MotionEvent) {
-        if (ev.action == MotionEvent.ACTION_OUTSIDE && targetFrac == 1f) {
-            handler.removeCallbacks(collapseRunnable)
-            animateTo(0f)
+    // ---------- Touch ----------
+
+    private fun isOnStrip(x: Float, y: Float): Boolean {
+        val s = strip ?: return false
+        if (s.visibility != View.VISIBLE) return false
+        val pad = dp(4)
+        return x >= s.left - pad && x <= s.right + pad && y >= s.top - pad && y <= s.bottom + pad
+    }
+
+    private fun onPillTouch(ev: MotionEvent): Boolean {
+        when (ev.action) {
+            MotionEvent.ACTION_OUTSIDE -> {
+                if (targetFrac == 1f && !replyMode) {
+                    handler.removeCallbacks(collapseRunnable)
+                    animateTo(0f)
+                }
+                return false
+            }
+            MotionEvent.ACTION_DOWN -> {
+                downX = ev.x
+                downY = ev.y
+                downOnStrip = isOnStrip(ev.x, ev.y)
+                if (targetFrac == 1f && !replyMode) handler.removeCallbacks(collapseRunnable)
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                val dx = ev.x - downX
+                val dy = ev.y - downY
+                val swipe = frac > 0.5f && event == EVENT_PAGE &&
+                    abs(dx) > dp(36) && abs(dx) > abs(dy) * 1.3f
+                if (swipe) {
+                    changePage(if (dx < 0) 1 else -1)
+                } else if (abs(dx) < dp(12) && abs(dy) < dp(12)) {
+                    if (!downOnStrip) onPillClick()
+                }
+                if (targetFrac == 1f && !replyMode) scheduleCollapse(collapseDelay())
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                if (targetFrac == 1f && !replyMode) scheduleCollapse(collapseDelay())
+                return true
+            }
         }
+        return true
     }
 
     private fun onPillClick() {
-        if (event == EVENT_NOTIF && frac > 0.5f) {
-            handler.removeCallbacks(collapseRunnable)
-            openNotification()
-            animateTo(0f)
-        } else {
-            toggle()
+        if (frac < 0.5f) {
+            expand()
+            return
         }
+        if (replyMode) {
+            animateTo(0f)
+            return
+        }
+        if (event == EVENT_PAGE) {
+            if (pageIsMusic(curPage)) {
+                openMusicApp()
+            } else {
+                val item = pageNotif(curPage)
+                if (item != null) openItem(item)
+            }
+        }
+        animateTo(0f)
     }
 
-    private fun applyBigHeight() {
-        bigH = when (event) {
-            EVENT_MUSIC -> dp(128)
-            EVENT_NOTIF -> dp(84)
-            else -> dp(80)
+    private fun expand() {
+        handler.removeCallbacks(collapseRunnable)
+        if (event == EVENT_NONE && pageCount() > 0) {
+            event = EVENT_PAGE
+            curPage = 0
+            renderPage()
         }
+        bigH = if (event == EVENT_PAGE) pageHeight() else dp(80)
+        animateTo(1f)
+        scheduleCollapse(collapseDelay())
+    }
+
+    private fun showPages(page: Int) {
+        event = EVENT_PAGE
+        curPage = page
+        chargeShown = false
+        renderPage()
+        val h = pageHeight()
+        if (frac > 0.99f) animateHeightTo(h) else bigH = h
+        handler.removeCallbacks(collapseRunnable)
+        animateTo(1f)
+        scheduleCollapse(collapseDelay())
     }
 
     private fun startEvent(e: Int) {
         if (box == null) return
+        if (replyMode) return
         event = e
         chargeShown = false
-        if (e == EVENT_PLUG || e == EVENT_UNPLUG) updateChargeTexts()
-        if (e == EVENT_MUSIC) refreshMusicViews()
-        applyBigHeight()
+        updateChargeTexts()
+        if (frac > 0.99f) animateHeightTo(dp(80)) else bigH = dp(80)
         handler.removeCallbacks(collapseRunnable)
         animateTo(1f)
-        scheduleCollapse(if (e == EVENT_NOTIF) NOTIF_COLLAPSE_MS else AUTO_COLLAPSE_MS)
+        scheduleCollapse(CHARGE_COLLAPSE_MS)
     }
 
     private fun updateChargeTexts() {
@@ -686,58 +1147,77 @@ class IslandService : Service() {
         chargeLevel?.text = "${batteryLevel()}%"
     }
 
-    private fun toggle() {
-        handler.removeCallbacks(collapseRunnable)
-        if (frac < 0.5f) {
-            // When a song is loaded, always show the music card (never battery info)
-            if (event == EVENT_NONE && hasMusic()) event = EVENT_MUSIC
-            applyBigHeight()
-            animateTo(1f)
-            scheduleCollapse(TAP_COLLAPSE_MS)
-        } else {
-            animateTo(0f)
-        }
-    }
-
     private fun scheduleCollapse(ms: Long) {
         handler.removeCallbacks(collapseRunnable)
         handler.postDelayed(collapseRunnable, ms)
     }
 
+    private fun animateHeightTo(h: Int) {
+        heightAnim?.cancel()
+        if (bigH == h) return
+        heightAnim = ValueAnimator.ofInt(bigH, h).apply {
+            duration = 220
+            interpolator = DecelerateInterpolator()
+            addUpdateListener {
+                bigH = it.animatedValue as Int
+                applyLayout()
+            }
+            start()
+        }
+    }
+
     private fun animateTo(target: Float) {
         if (box == null || params == null) return
+        if (target == 0f && replyMode) exitReply()
         targetFrac = target
         animator?.cancel()
+        val ip: TimeInterpolator = if (target == 0f) {
+            AccelerateDecelerateInterpolator()
+        } else {
+            OvershootInterpolator(1.05f)
+        }
         animator = ValueAnimator.ofFloat(frac, target).apply {
-            duration = 350
-            interpolator = OvershootInterpolator(1.1f)
+            duration = if (target == 0f) 300L else ANIM_MS
+            interpolator = ip
             addUpdateListener { a ->
                 frac = a.animatedValue as Float
-                val lp = params ?: return@addUpdateListener
-                lp.width = (smallW + (bigW - smallW) * frac).toInt()
-                lp.height = (smallH + (bigH - smallH) * frac).toInt()
-                cornerPx = minOf(lp.height / 2f, dp(34).toFloat())
-                bg?.cornerRadius = cornerPx
-                val v = box ?: return@addUpdateListener
-                v.invalidateOutline()
-                if (v.isAttachedToWindow) wm?.updateViewLayout(v, lp)
+                applyLayout()
                 renderContent()
             }
             start()
         }
     }
 
+    private fun applyLayout() {
+        val lp = params ?: return
+        lp.width = (smallW + (bigW - smallW) * frac).toInt()
+        lp.height = (smallH + (bigH - smallH) * frac).toInt()
+        cornerPx = minOf(lp.height / 2f, dp(34).toFloat())
+        bg?.cornerRadius = cornerPx
+        val v = box ?: return
+        v.invalidateOutline()
+        if (v.isAttachedToWindow) wm?.updateViewLayout(v, lp)
+    }
+
     private fun renderContent() {
         if (targetFrac == 0f && frac < 0.3f && event != EVENT_NONE) {
             event = EVENT_NONE
             chargeView?.stop()
+            exitReply()
+        }
+        if (event == EVENT_PAGE) {
+            curPage = curPage.coerceIn(0, maxOf(0, pageCount() - 1))
+            if (pageCount() == 0 && targetFrac == 1f) {
+                handler.post { animateTo(0f) }
+            }
         }
 
         val showCompact = frac < 0.3f && event == EVENT_NONE && musicPlaying
         compactArt?.visibility = if (showCompact) View.VISIBLE else View.GONE
         compactEq?.visibility = if (showCompact) View.VISIBLE else View.GONE
 
-        val artBg = event == EVENT_MUSIC && musicArt != null
+        val musicPage = event == EVENT_PAGE && pageIsMusic(curPage)
+        val artBg = musicPage && musicArt != null
         bgArt?.visibility = if (artBg) View.VISIBLE else View.GONE
         bgScrim?.visibility = if (artBg) View.VISIBLE else View.GONE
 
@@ -746,6 +1226,7 @@ class IslandService : Service() {
             chargeRow?.visibility = View.GONE
             musicCard?.visibility = View.GONE
             notifRow?.visibility = View.GONE
+            strip?.visibility = View.GONE
             return
         }
 
@@ -754,28 +1235,26 @@ class IslandService : Service() {
                 label?.visibility = View.GONE
                 musicCard?.visibility = View.GONE
                 notifRow?.visibility = View.GONE
+                strip?.visibility = View.GONE
                 chargeRow?.visibility = View.VISIBLE
                 if (!chargeShown) {
                     chargeShown = true
                     chargeView?.play(batteryLevel(), event == EVENT_UNPLUG)
                 }
             }
-            EVENT_MUSIC -> {
+            EVENT_PAGE -> {
                 label?.visibility = View.GONE
                 chargeRow?.visibility = View.GONE
-                notifRow?.visibility = View.GONE
-                musicCard?.visibility = View.VISIBLE
-            }
-            EVENT_NOTIF -> {
-                label?.visibility = View.GONE
-                chargeRow?.visibility = View.GONE
-                musicCard?.visibility = View.GONE
-                notifRow?.visibility = View.VISIBLE
+                musicCard?.visibility = if (musicPage) View.VISIBLE else View.GONE
+                notifRow?.visibility =
+                    if (!musicPage && pageNotif(curPage) != null) View.VISIBLE else View.GONE
+                strip?.visibility = if (notifs.isNotEmpty()) View.VISIBLE else View.GONE
             }
             else -> {
                 chargeRow?.visibility = View.GONE
                 musicCard?.visibility = View.GONE
                 notifRow?.visibility = View.GONE
+                strip?.visibility = View.GONE
                 if (label?.visibility != View.VISIBLE) showInfo()
             }
         }
@@ -795,6 +1274,7 @@ class IslandService : Service() {
     private fun removePill() {
         handler.removeCallbacks(collapseRunnable)
         animator?.cancel()
+        heightAnim?.cancel()
         chargeView?.stop()
         cardEq?.setActive(false)
         compactEq?.setActive(false)
@@ -823,6 +1303,10 @@ class IslandService : Service() {
         notifApp = null
         notifTitle = null
         notifText = null
+        notifBtnRow = null
+        notifInputRow = null
+        notifInput = null
+        strip = null
     }
 
     override fun onDestroy() {
@@ -838,6 +1322,11 @@ class IslandService : Service() {
         try {
             unregisterReceiver(receiver)
         } catch (e: Exception) {
+        }
+        val prefs = getSharedPreferences("island", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("headsup_off", false)) {
+            val ctx = applicationContext
+            Thread { ShizukuHelper.setHeadsUp(ctx, true) }.start()
         }
         running = false
         super.onDestroy()
