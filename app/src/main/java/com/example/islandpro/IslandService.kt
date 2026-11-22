@@ -59,6 +59,7 @@ class IslandService : Service() {
         private const val CHANNEL_ID = "island_channel"
         private const val AUTO_COLLAPSE_MS = 3500L
         private const val MUSIC_COLLAPSE_MS = 5000L
+        private const val TAP_COLLAPSE_MS = 1300L
         private const val EVENT_NONE = 0
         private const val EVENT_PLUG = 1
         private const val EVENT_UNPLUG = 2
@@ -78,7 +79,7 @@ class IslandService : Service() {
     private var cardTitle: TextView? = null
     private var cardArtist: TextView? = null
     private var cardEq: EqView? = null
-    private var playBtn: TextView? = null
+    private var playBtn: MediaButton? = null
     private var compactArt: ImageView? = null
     private var compactEq: EqView? = null
     private var params: WindowManager.LayoutParams? = null
@@ -242,7 +243,9 @@ class IslandService : Service() {
 
         refreshMusicViews()
 
-        if (announce && started && event != EVENT_PLUG && event != EVENT_UNPLUG) {
+        // If the battery/time info is open when music appears, switch to the music card
+        val infoOpen = event == EVENT_NONE && targetFrac == 1f && hasMusic()
+        if (announce && event != EVENT_PLUG && event != EVENT_UNPLUG && (started || infoOpen)) {
             startEvent(EVENT_MUSIC)
         }
     }
@@ -252,7 +255,7 @@ class IslandService : Service() {
         cardArtist?.text = musicArtist
         cardArt?.setImageBitmap(musicArt)
         compactArt?.setImageBitmap(musicArt)
-        playBtn?.text = if (musicPlaying) "⏸" else "▶"
+        playBtn?.icon = if (musicPlaying) MediaButton.PAUSE else MediaButton.PLAY
         cardEq?.setActive(musicPlaying)
         compactEq?.setActive(musicPlaying)
         renderContent()
@@ -280,13 +283,12 @@ class IslandService : Service() {
         }
     }
 
-    private fun ctl(symbol: String, onClick: () -> Unit): TextView {
-        return TextView(this).apply {
-            text = symbol
-            textSize = 22f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setOnClickListener { onClick() }
+    private fun mediaBtn(kind: Int, onClick: () -> Unit): MediaButton {
+        return MediaButton(this, kind).apply {
+            setOnClickListener {
+                onClick()
+                scheduleCollapse(TAP_COLLAPSE_MS)
+            }
         }
     }
 
@@ -385,23 +387,30 @@ class IslandService : Service() {
             )
             addView(mEq, LinearLayout.LayoutParams(dp(34), dp(28)))
         }
-        val pBtn = ctl("▶") {
+
+        val prevBtn = mediaBtn(MediaButton.PREV) {
+            controller?.transportControls?.skipToPrevious()
+        }
+        val pBtn = mediaBtn(MediaButton.PLAY) {
             val tc = controller?.transportControls
             if (musicPlaying) tc?.pause() else tc?.play()
+        }
+        val nextBtn = mediaBtn(MediaButton.NEXT) {
+            controller?.transportControls?.skipToNext()
         }
         playBtn = pBtn
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
+            addView(prevBtn, LinearLayout.LayoutParams(dp(44), dp(44)))
             addView(
-                ctl("⏮") { controller?.transportControls?.skipToPrevious() },
-                LinearLayout.LayoutParams(dp(64), dp(38))
+                pBtn,
+                LinearLayout.LayoutParams(dp(52), dp(52)).apply {
+                    marginStart = dp(16)
+                    marginEnd = dp(16)
+                }
             )
-            addView(pBtn, LinearLayout.LayoutParams(dp(64), dp(38)))
-            addView(
-                ctl("⏭") { controller?.transportControls?.skipToNext() },
-                LinearLayout.LayoutParams(dp(64), dp(38))
-            )
+            addView(nextBtn, LinearLayout.LayoutParams(dp(44), dp(44)))
         }
         val mCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -483,7 +492,7 @@ class IslandService : Service() {
     }
 
     private fun applyBigHeight() {
-        bigH = if (event == EVENT_MUSIC) dp(118) else dp(80)
+        bigH = if (event == EVENT_MUSIC) dp(128) else dp(80)
     }
 
     private fun startEvent(e: Int) {
@@ -507,9 +516,11 @@ class IslandService : Service() {
     private fun toggle() {
         handler.removeCallbacks(collapseRunnable)
         if (frac < 0.5f) {
+            // When a song is loaded, always show the music card (never battery info)
             if (event == EVENT_NONE && hasMusic()) event = EVENT_MUSIC
             applyBigHeight()
             animateTo(1f)
+            scheduleCollapse(TAP_COLLAPSE_MS)
         } else {
             animateTo(0f)
         }
@@ -633,6 +644,90 @@ class IslandService : Service() {
         }
         running = false
         super.onDestroy()
+    }
+}
+
+internal class MediaButton(context: Context, initial: Int) : View(context) {
+
+    companion object {
+        const val PREV = 0
+        const val PLAY = 1
+        const val PAUSE = 2
+        const val NEXT = 3
+    }
+
+    var icon: Int = initial
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val path = Path()
+    private val rect = RectF()
+
+    override fun setPressed(pressed: Boolean) {
+        super.setPressed(pressed)
+        val target = if (pressed) 0.88f else 1f
+        animate().scaleX(target).scaleY(target).setDuration(90).start()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val cx = w / 2f
+        val cy = h / 2f
+        val d = minOf(w, h)
+        val big = icon == PLAY || icon == PAUSE
+
+        paint.style = Paint.Style.FILL
+        paint.color = if (big) Color.WHITE else Color.parseColor("#33FFFFFF")
+        canvas.drawCircle(cx, cy, d / 2f, paint)
+
+        val s = d * (if (big) 0.40f else 0.34f)
+        paint.color = if (big) Color.BLACK else Color.WHITE
+        paint.style = Paint.Style.FILL_AND_STROKE
+        paint.strokeJoin = Paint.Join.ROUND
+        paint.strokeWidth = d * 0.04f
+
+        when (icon) {
+            PLAY -> {
+                path.reset()
+                path.moveTo(cx - 0.38f * s, cy - 0.5f * s)
+                path.lineTo(cx + 0.52f * s, cy)
+                path.lineTo(cx - 0.38f * s, cy + 0.5f * s)
+                path.close()
+                canvas.drawPath(path, paint)
+            }
+            PAUSE -> {
+                val bw = 0.26f * s
+                val gap = 0.24f * s
+                rect.set(cx - gap / 2f - bw, cy - 0.5f * s, cx - gap / 2f, cy + 0.5f * s)
+                canvas.drawRoundRect(rect, bw * 0.3f, bw * 0.3f, paint)
+                rect.set(cx + gap / 2f, cy - 0.5f * s, cx + gap / 2f + bw, cy + 0.5f * s)
+                canvas.drawRoundRect(rect, bw * 0.3f, bw * 0.3f, paint)
+            }
+            NEXT -> {
+                path.reset()
+                path.moveTo(cx - 0.5f * s, cy - 0.45f * s)
+                path.lineTo(cx + 0.2f * s, cy)
+                path.lineTo(cx - 0.5f * s, cy + 0.45f * s)
+                path.close()
+                canvas.drawPath(path, paint)
+                rect.set(cx + 0.32f * s, cy - 0.45f * s, cx + 0.5f * s, cy + 0.45f * s)
+                canvas.drawRoundRect(rect, 0.05f * s, 0.05f * s, paint)
+            }
+            else -> {
+                path.reset()
+                path.moveTo(cx + 0.5f * s, cy - 0.45f * s)
+                path.lineTo(cx - 0.2f * s, cy)
+                path.lineTo(cx + 0.5f * s, cy + 0.45f * s)
+                path.close()
+                canvas.drawPath(path, paint)
+                rect.set(cx - 0.5f * s, cy - 0.45f * s, cx - 0.32f * s, cy + 0.45f * s)
+                canvas.drawRoundRect(rect, 0.05f * s, 0.05f * s, paint)
+            }
+        }
     }
 }
 
