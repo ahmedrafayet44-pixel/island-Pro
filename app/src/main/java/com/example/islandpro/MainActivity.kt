@@ -17,7 +17,9 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
+import android.widget.Toast
 
 class MainActivity : Activity() {
 
@@ -32,6 +34,7 @@ class MainActivity : Activity() {
     private lateinit var statusText: TextView
     private lateinit var permText: TextView
     private lateinit var musicStatus: TextView
+    private lateinit var shizukuStatus: TextView
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -70,23 +73,23 @@ class MainActivity : Activity() {
         statusCard.addView(row)
         root.addView(statusCard)
 
-        // Music card
-        val musicCard = card()
-        musicCard.addView(label("Music", 18f, textMain, true))
+        // Notification access card
+        val accessCard = card()
+        accessCard.addView(label("Notification access", 18f, textMain, true))
         musicStatus = label("", 14f, textDim, false).apply { setPadding(0, dp(4), 0, 0) }
-        musicCard.addView(musicStatus)
-        musicCard.addView(
+        accessCard.addView(musicStatus)
+        accessCard.addView(
             label(
-                "Needed to show album art and controls. If the switch is blocked, " +
+                "Needed to show music and notifications. If the switch is blocked, " +
                     "open App info, tap the three-dot menu and choose Allow restricted settings.",
                 12f, textDim, false
             ).apply { setPadding(0, dp(6), 0, dp(10)) }
         )
-        val musicRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        musicRow.addView(actionButton("Grant access", true) {
+        val accessRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        accessRow.addView(actionButton("Grant access", true) {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         }, buttonParams())
-        musicRow.addView(actionButton("App info", false) {
+        accessRow.addView(actionButton("App info", false) {
             startActivity(
                 Intent(
                     Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
@@ -94,8 +97,61 @@ class MainActivity : Activity() {
                 )
             )
         }, buttonParams())
-        musicCard.addView(musicRow)
-        root.addView(musicCard)
+        accessCard.addView(accessRow)
+        root.addView(accessCard)
+
+        // Shizuku card
+        val shizukuCard = card()
+        shizukuCard.addView(label("Pop-up banners (Shizuku)", 18f, textMain, true))
+        shizukuStatus = label("", 14f, textDim, false).apply { setPadding(0, dp(4), 0, 0) }
+        shizukuCard.addView(shizukuStatus)
+        shizukuCard.addView(
+            label(
+                "Install and start Shizuku first. Then Island can hide the phone's own " +
+                    "pop-up banners while it runs. Your notification shade stays as it is. " +
+                    "Incoming call banners may also be hidden, so turn this off if you need them.",
+                12f, textDim, false
+            ).apply { setPadding(0, dp(6), 0, dp(10)) }
+        )
+        val shizukuRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        shizukuRow.addView(actionButton("Grant", true) {
+            ShizukuHelper.requestPermission(100)
+            refreshLater()
+        }, buttonParams())
+        shizukuRow.addView(actionButton("Open Shizuku", false) {
+            val i = packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
+            if (i != null) {
+                startActivity(i)
+            } else {
+                Toast.makeText(this, "Shizuku app is not installed", Toast.LENGTH_SHORT).show()
+            }
+        }, buttonParams())
+        shizukuCard.addView(shizukuRow)
+        shizukuCard.addView(
+            makeSwitch("Hide phone's pop-up banners", "hide_popups", true) { checked ->
+                if (IslandService.running) {
+                    val ctx = applicationContext
+                    Thread { ShizukuHelper.setHeadsUp(ctx, !checked) }.start()
+                }
+            }
+        )
+        root.addView(shizukuCard)
+
+        // Shade card (fallback without Shizuku)
+        val shadeCard = card()
+        shadeCard.addView(label("Notification shade", 18f, textMain, true))
+        shadeCard.addView(
+            makeSwitch("Also remove shown notifications from the shade", "hide_sys", false)
+        )
+        shadeCard.addView(
+            label(
+                "Off keeps everything in the phone's shade as normal. Turn on only if " +
+                    "you do not use Shizuku and want no duplicate banners. Reply may not " +
+                    "work in some apps once a notification is removed.",
+                12f, textDim, false
+            ).apply { setPadding(0, dp(6), 0, 0) }
+        )
+        root.addView(shadeCard)
 
         // Size card
         val sizeCard = card()
@@ -146,6 +202,11 @@ class MainActivity : Activity() {
         if (IslandService.running && !IslandService.mediaReady && listenerEnabled()) {
             startForegroundService(Intent(this, IslandService::class.java))
         }
+        // If Island was killed while pop-ups were hidden, bring them back
+        if (!IslandService.running && prefs.getBoolean("headsup_off", false)) {
+            val ctx = applicationContext
+            Thread { ShizukuHelper.setHeadsUp(ctx, true) }.start()
+        }
     }
 
     private fun listenerEnabled(): Boolean {
@@ -168,14 +229,20 @@ class MainActivity : Activity() {
             "Overlay permission: Not granted (tap Start to grant)"
         }
         musicStatus.text = if (listenerEnabled()) {
-            "Music access: Granted"
+            "Notification access: Granted"
         } else {
-            "Music access: Not granted"
+            "Notification access: Not granted"
+        }
+        shizukuStatus.text = when {
+            !ShizukuHelper.isRunning() -> "Shizuku: Not running"
+            !ShizukuHelper.hasPermission() -> "Shizuku: Running, permission needed"
+            else -> "Shizuku: Ready"
         }
     }
 
     private fun refreshLater() {
-        statusText.postDelayed({ refresh() }, 500)
+        statusText.postDelayed({ refresh() }, 800)
+        statusText.postDelayed({ refresh() }, 2500)
     }
 
     private fun startIsland() {
@@ -241,6 +308,25 @@ class MainActivity : Activity() {
             }
             stateListAnimator = null
             setOnClickListener { onClick() }
+        }
+    }
+
+    private fun makeSwitch(
+        text: String,
+        key: String,
+        def: Boolean,
+        onChange: (Boolean) -> Unit = {}
+    ): Switch {
+        return Switch(this).apply {
+            this.text = text
+            textSize = 14f
+            setTextColor(textMain)
+            isChecked = prefs.getBoolean(key, def)
+            setPadding(0, dp(10), 0, dp(4))
+            setOnCheckedChangeListener { _, checked ->
+                prefs.edit().putBoolean(key, checked).apply()
+                onChange(checked)
+            }
         }
     }
 
