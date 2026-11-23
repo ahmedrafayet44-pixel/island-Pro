@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.islandpro"
         minSdk = 26
         targetSdk = 34
-        versionCode = 8
-        versionName = "1.0"
+        versionCode = 9
+        versionName = "1.1"
     }
 
     compileOptions {
