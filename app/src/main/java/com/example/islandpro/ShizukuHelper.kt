@@ -61,4 +61,9 @@ object ShizukuHelper {
         }
         return ok
     }
+
+    fun expandShade(): Boolean {
+        if (!hasPermission()) return false
+        return run("cmd statusbar expand-notifications")
+    }
 }
