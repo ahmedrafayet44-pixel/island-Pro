@@ -1,6 +1,7 @@
 package com.example.islandpro
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -13,6 +14,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
+import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -29,6 +31,16 @@ class MainActivity : Activity() {
     private val green = Color.parseColor("#3DDC84")
     private val textMain = Color.WHITE
     private val textDim = Color.parseColor("#9AA0AE")
+
+    private val swatchColors = intArrayOf(
+        0xFF000000.toInt(),
+        0xFF1C1C1E.toInt(),
+        0xFF0B1B3A.toInt(),
+        0xFF3A0B1B.toInt(),
+        0xFF0B3A22.toInt(),
+        0xFF25104A.toInt()
+    )
+    private val swatchViews = ArrayList<View>()
 
     private lateinit var prefs: SharedPreferences
     private lateinit var statusText: TextView
@@ -55,7 +67,7 @@ class MainActivity : Activity() {
             setPadding(0, dp(2), 0, dp(18))
         })
 
-        // Status card
+        // Status
         val statusCard = card()
         statusText = label("", 18f, textMain, true)
         permText = label("", 14f, textDim, false).apply { setPadding(0, dp(4), 0, 0) }
@@ -73,14 +85,14 @@ class MainActivity : Activity() {
         statusCard.addView(row)
         root.addView(statusCard)
 
-        // Notification access card
+        // Notification access
         val accessCard = card()
         accessCard.addView(label("Notification access", 18f, textMain, true))
         musicStatus = label("", 14f, textDim, false).apply { setPadding(0, dp(4), 0, 0) }
         accessCard.addView(musicStatus)
         accessCard.addView(
             label(
-                "Needed to show music and notifications. If the switch is blocked, " +
+                "Needed to show music, notifications and calls. If the switch is blocked, " +
                     "open App info, tap the three-dot menu and choose Allow restricted settings.",
                 12f, textDim, false
             ).apply { setPadding(0, dp(6), 0, dp(10)) }
@@ -100,7 +112,28 @@ class MainActivity : Activity() {
         accessCard.addView(accessRow)
         root.addView(accessCard)
 
-        // Shizuku card
+        // Behavior
+        val behCard = card()
+        behCard.addView(label("Behavior", 18f, textMain, true))
+        behCard.addView(makeSwitch("Start automatically when the phone turns on", "autostart", true))
+        behCard.addView(makeSwitch("Haptic feedback", "haptic", true) { restartIfRunning() })
+        behCard.addView(
+            makeSwitch("Hide Island in landscape (video and games)", "hide_land", true) {
+                restartIfRunning()
+            }
+        )
+        behCard.addView(
+            makeSwitch("Show volume and brightness bar", "show_bars", true) { restartIfRunning() }
+        )
+        behCard.addView(
+            actionButton("Choose apps for notifications", false) { chooseApps() },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(52)
+            ).apply { topMargin = dp(14) }
+        )
+        root.addView(behCard)
+
+        // Shizuku
         val shizukuCard = card()
         shizukuCard.addView(label("Pop-up banners (Shizuku)", 18f, textMain, true))
         shizukuStatus = label("", 14f, textDim, false).apply { setPadding(0, dp(4), 0, 0) }
@@ -137,7 +170,7 @@ class MainActivity : Activity() {
         )
         root.addView(shizukuCard)
 
-        // Shade card (fallback without Shizuku)
+        // Shade fallback
         val shadeCard = card()
         shadeCard.addView(label("Notification shade", 18f, textMain, true))
         shadeCard.addView(
@@ -153,21 +186,42 @@ class MainActivity : Activity() {
         )
         root.addView(shadeCard)
 
-        // Size card
+        // Appearance
+        val lookCard = card()
+        lookCard.addView(label("Appearance", 18f, textMain, true))
+        val sw = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(12), 0, dp(4))
+        }
+        for (i in swatchColors.indices) {
+            val v = View(this)
+            v.setOnClickListener {
+                prefs.edit().putInt("pill_color", swatchColors[i]).apply()
+                styleSwatches()
+                restartIfRunning()
+            }
+            swatchViews.add(v)
+            sw.addView(v, LinearLayout.LayoutParams(dp(38), dp(38)).apply { rightMargin = dp(10) })
+        }
+        lookCard.addView(sw)
+        styleSwatches()
+        addSlider(lookCard, "Opacity (%)", "pill_alpha", 40, 100, 100)
+        root.addView(lookCard)
+
+        // Size
         val sizeCard = card()
         sizeCard.addView(label("Size", 18f, textMain, true))
         addSlider(sizeCard, "Width", "w", 60, 220, 120)
         addSlider(sizeCard, "Height", "h", 20, 70, 34)
         root.addView(sizeCard)
 
-        // Position card
+        // Position
         val posCard = card()
         posCard.addView(label("Position", 18f, textMain, true))
         addSlider(posCard, "Distance from top", "top", 0, 80, 8)
         addSlider(posCard, "Left  <  0  >  Right", "x", -200, 200, 0)
         root.addView(posCard)
 
-        // Reset
         root.addView(actionButton("Reset to defaults", false) {
             prefs.edit().clear().apply()
             restartIfRunning()
@@ -202,11 +256,49 @@ class MainActivity : Activity() {
         if (IslandService.running && !IslandService.mediaReady && listenerEnabled()) {
             startForegroundService(Intent(this, IslandService::class.java))
         }
-        // If Island was killed while pop-ups were hidden, bring them back
         if (!IslandService.running && prefs.getBoolean("headsup_off", false)) {
             val ctx = applicationContext
             Thread { ShizukuHelper.setHeadsUp(ctx, true) }.start()
         }
+    }
+
+    private fun styleSwatches() {
+        val cur = prefs.getInt("pill_color", swatchColors[0])
+        for (i in swatchViews.indices) {
+            val sel = swatchColors[i] == cur
+            swatchViews[i].background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(swatchColors[i])
+                setStroke(dp(if (sel) 3 else 1), if (sel) accent else Color.parseColor("#555B66"))
+            }
+        }
+    }
+
+    private fun chooseApps() {
+        val pm = packageManager
+        val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val list = pm.queryIntentActivities(main, 0)
+            .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
+            .filter { it.first != packageName }
+            .distinctBy { it.first }
+            .sortedBy { it.second.lowercase() }
+        val blocked = HashSet<String>(prefs.getStringSet("blocked_apps", null) ?: emptySet())
+        val names = list.map { it.second }.toTypedArray()
+        val checked = BooleanArray(list.size) { !blocked.contains(list[it].first) }
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Apps shown in Island")
+            .setMultiChoiceItems(names, checked) { _, which, isChecked ->
+                checked[which] = isChecked
+            }
+            .setPositiveButton("Save") { _, _ ->
+                val nb = HashSet<String>()
+                for (i in list.indices) {
+                    if (!checked[i]) nb.add(list[i].first)
+                }
+                prefs.edit().putStringSet("blocked_apps", nb).apply()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun listenerEnabled(): Boolean {
