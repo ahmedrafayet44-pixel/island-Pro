@@ -47,6 +47,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.Settings
 import android.service.notification.StatusBarNotification
+import android.telecom.TelecomManager
 import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
@@ -156,6 +157,8 @@ class IslandService : Service() {
     private var bg: GradientDrawable? = null
     private var bgArt: ImageView? = null
     private var bgScrim: View? = null
+    private var infoRow: LinearLayout? = null
+    private var infoIcon: GlyphView? = null
     private var label: TextView? = null
     private var chargeRow: LinearLayout? = null
     private var chargeView: ChargeView? = null
@@ -189,14 +192,14 @@ class IslandService : Service() {
     private var alertLeft: TextView? = null
     private var alertRight: TextView? = null
     private var toastRow: LinearLayout? = null
-    private var toastIcon: TextView? = null
+    private var toastIcon: GlyphView? = null
     private var toastTitle: TextView? = null
     private var toastSub: TextView? = null
     private var quickRow: LinearLayout? = null
-    private var qTorch: TextView? = null
-    private var qRinger: TextView? = null
+    private var qTorch: GlyphView? = null
+    private var qRinger: GlyphView? = null
     private var barRow: LinearLayout? = null
-    private var barIcon: TextView? = null
+    private var barIcon: GlyphView? = null
     private var barText: TextView? = null
     private var barView: BarView? = null
     private var strip: LinearLayout? = null
@@ -205,6 +208,8 @@ class IslandService : Service() {
     private var badgeR: LinearLayout? = null
     private var dotCam: View? = null
     private var dotMic: View? = null
+    private var chargeBadge: LinearLayout? = null
+    private var chargeBadgeText: TextView? = null
     private var params: WindowManager.LayoutParams? = null
     private var animator: ValueAnimator? = null
     private var heightAnim: ValueAnimator? = null
@@ -254,6 +259,9 @@ class IslandService : Service() {
     private val camUnavail = HashSet<String>()
 
     private var msm: MediaSessionManager? = null
+    private val ctls = ArrayList<MediaController>()
+    private val ctlCallbacks = ArrayList<MediaController.Callback>()
+    private var lastPlayingPkg: String? = null
     private var controller: MediaController? = null
     private var musicTitle = ""
     private var musicArtist = ""
@@ -299,23 +307,13 @@ class IslandService : Service() {
     }
 
     private val sessionsListener =
-        MediaSessionManager.OnActiveSessionsChangedListener { list -> pickController(list) }
-
-    private val mediaCallback = object : MediaController.Callback() {
-        override fun onPlaybackStateChanged(state: PlaybackState?) {
-            updateMusic()
-        }
-
-        override fun onMetadataChanged(metadata: MediaMetadata?) {
-            updateMusic()
-        }
-    }
+        MediaSessionManager.OnActiveSessionsChangedListener { list -> watchControllers(list) }
 
     private val brightnessObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
         override fun onChange(selfChange: Boolean) {
             try {
                 val v = Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS)
-                showBar("☀", "Brightness", v / 255f)
+                showBar(GlyphView.SUN, "Brightness", v / 255f)
             } catch (e: Exception) {
             }
         }
@@ -356,18 +354,21 @@ class IslandService : Service() {
                 Intent.ACTION_POWER_CONNECTED -> {
                     charging = true
                     warnStage = 0
+                    updateChargeBadge()
                     startEvent(EVENT_PLUG)
                 }
                 Intent.ACTION_POWER_DISCONNECTED -> {
                     charging = false
+                    updateChargeBadge()
                     startEvent(EVENT_UNPLUG)
                 }
                 Intent.ACTION_BATTERY_CHANGED -> {
                     if (event == EVENT_PLUG || event == EVENT_UNPLUG) {
                         updateChargeTexts()
-                    } else if (event == EVENT_NONE && label?.visibility == View.VISIBLE) {
+                    } else if (event == EVENT_NONE && infoRow?.visibility == View.VISIBLE) {
                         showInfo()
                     }
+                    updateChargeBadge()
                     checkLowBattery()
                 }
                 AudioManager.RINGER_MODE_CHANGED_ACTION -> onRinger()
@@ -614,8 +615,7 @@ class IslandService : Service() {
         val cat = n.category
 
         if (cat == Notification.CATEGORY_CALL) {
-            handleCall(sbn, n, ex)
-            return
+            if (handleCall(sbn, n, ex)) return
         }
         val acts0 = n.actions
         if (cat == Notification.CATEGORY_ALARM) {
@@ -796,13 +796,40 @@ class IslandService : Service() {
 
     // ---------- Calls and alarms ----------
 
+    private fun telecomAnswer(accept: Boolean): Boolean {
+        if (checkSelfPermission("android.permission.ANSWER_PHONE_CALLS") !=
+            PackageManager.PERMISSION_GRANTED
+        ) return false
+        return try {
+            val tm = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+            if (accept) {
+                tm.acceptRingingCall()
+                true
+            } else if (Build.VERSION.SDK_INT >= 28) {
+                tm.endCall()
+            } else {
+                false
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     @Suppress("DEPRECATION")
-    private fun handleCall(sbn: StatusBarNotification, n: Notification, ex: Bundle) {
+    private fun handleCall(sbn: StatusBarNotification, n: Notification, ex: Bundle): Boolean {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val mode = am.mode
         val ct = ex.getInt("android.callType", 0)
-        val ongoingFlag = (n.flags and Notification.FLAG_ONGOING_EVENT) != 0
-        val incoming = ct == 1 || (ct == 0 && n.fullScreenIntent != null)
-        val inCall = ct == 2 || (ct == 0 && ongoingFlag && n.fullScreenIntent == null)
-        if (!incoming && !inCall) return
+        val chrono = ex.getBoolean(Notification.EXTRA_SHOW_CHRONOMETER, false)
+        val incoming = ct == 1 ||
+            (ct == 0 && (n.fullScreenIntent != null || mode == AudioManager.MODE_RINGTONE))
+        val inCall = !incoming && (
+            ct == 2 || (ct == 0 && (
+                chrono || mode == AudioManager.MODE_IN_CALL ||
+                    mode == AudioManager.MODE_IN_COMMUNICATION
+                ))
+            )
+        if (!incoming && !inCall) return false
 
         val title = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
         val name = title.ifEmpty {
@@ -832,12 +859,12 @@ class IslandService : Service() {
             }
             alert = AlertItem(
                 sbn.key, 0, name, "Incoming call", icon,
-                if (dec != null) "Decline" else "", "#FF453A", dec,
-                if (ans != null) "Accept" else "", "#30D158", ans,
+                "Decline", "#FF453A", dec,
+                "Accept", "#30D158", ans,
                 open, System.currentTimeMillis()
             )
             if (box != null) showAlert()
-            return
+            return true
         }
 
         var hang: PendingIntent? = ex.getParcelable("android.hangUpIntent")
@@ -858,7 +885,7 @@ class IslandService : Service() {
         ongoing = AlertItem(
             sbn.key, 2, name, "Call", icon,
             if (mute != null) "Mute" else "", "#33FFFFFF", mute,
-            if (hang != null) "End call" else "", "#FF453A", hang,
+            "End call", "#FF453A", hang,
             open, start
         )
         if (alert?.key == sbn.key) {
@@ -871,6 +898,7 @@ class IslandService : Service() {
             renderPage()
             renderContent()
         }
+        return true
     }
 
     private fun handleAlarm(sbn: StatusBarNotification, n: Notification, ex: Bundle) {
@@ -933,9 +961,29 @@ class IslandService : Service() {
             null
         }
         if (a == null) return
-        val pi = if (left) a.left else a.right
-        if (pi != null) sendPi(pi)
-        if (event == EVENT_ALERT) alert = null
+        if (a.kind == 0) {
+            // left = Decline, right = Accept
+            if (!telecomAnswer(!left)) {
+                val pi = if (left) a.left else a.right
+                if (pi != null) sendPi(pi)
+            }
+            alert = null
+        } else if (a.kind == 2) {
+            if (left) {
+                val pi = a.left
+                if (pi != null) sendPi(pi)
+            } else {
+                if (!telecomAnswer(false)) {
+                    val pi = a.right
+                    if (pi != null) sendPi(pi)
+                }
+            }
+        } else {
+            val pi = if (left) a.left else a.right
+            if (pi != null) sendPi(pi)
+            if (event == EVENT_ALERT) alert = null
+        }
+        haptic(true)
         scheduleCollapse(1500)
     }
 
@@ -1007,7 +1055,7 @@ class IslandService : Service() {
         renderPage()
     }
 
-    // ---------- Media ----------
+    // ---------- Media (watches every music app) ----------
 
     private fun setupMedia() {
         try {
@@ -1020,20 +1068,63 @@ class IslandService : Service() {
             m.addOnActiveSessionsChangedListener(sessionsListener, cn, handler)
             msm = m
             mediaReady = true
-            pickController(m.getActiveSessions(cn))
+            watchControllers(m.getActiveSessions(cn))
         } catch (e: SecurityException) {
             mediaReady = false
         }
     }
 
-    private fun pickController(list: List<MediaController>?) {
-        val best = list?.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
-            ?: list?.firstOrNull()
-        if (best?.sessionToken != controller?.sessionToken) {
-            controller?.unregisterCallback(mediaCallback)
-            controller = best
-            controller?.registerCallback(mediaCallback, handler)
+    private fun clearControllers() {
+        for (i in ctls.indices) {
+            try {
+                ctls[i].unregisterCallback(ctlCallbacks[i])
+            } catch (e: Exception) {
+            }
         }
+        ctls.clear()
+        ctlCallbacks.clear()
+    }
+
+    private fun watchControllers(list: List<MediaController>?) {
+        clearControllers()
+        if (list != null) {
+            for (c in list) {
+                val cb = object : MediaController.Callback() {
+                    override fun onPlaybackStateChanged(state: PlaybackState?) {
+                        if (state?.state == PlaybackState.STATE_PLAYING) {
+                            lastPlayingPkg = c.packageName
+                        }
+                        reselect()
+                    }
+
+                    override fun onMetadataChanged(metadata: MediaMetadata?) {
+                        reselect()
+                    }
+                }
+                c.registerCallback(cb, handler)
+                ctls.add(c)
+                ctlCallbacks.add(cb)
+                if (lastPlayingPkg == null &&
+                    c.playbackState?.state == PlaybackState.STATE_PLAYING
+                ) {
+                    lastPlayingPkg = c.packageName
+                }
+            }
+        }
+        reselect()
+    }
+
+    private fun reselect() {
+        val playing = ctls.filter { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+        val cur = controller
+        val pick: MediaController? = when {
+            playing.isNotEmpty() ->
+                playing.firstOrNull { it.packageName == lastPlayingPkg } ?: playing[0]
+            cur != null && ctls.any { it.sessionToken == cur.sessionToken } ->
+                ctls.first { it.sessionToken == cur.sessionToken }
+            else -> ctls.firstOrNull()
+        }
+        controller = pick
         updateMusic()
     }
 
@@ -1074,9 +1165,9 @@ class IslandService : Service() {
 
     // ---------- Small events ----------
 
-    private fun showToast(icon: String, title: String, sub: String) {
+    private fun showToast(g: Int, title: String, sub: String) {
         if (box == null || hidden || replyMode || busy()) return
-        toastIcon?.text = icon
+        toastIcon?.glyph = g
         toastTitle?.text = title
         toastSub?.text = sub
         toastSub?.visibility = if (sub.isEmpty()) View.GONE else View.VISIBLE
@@ -1102,16 +1193,16 @@ class IslandService : Service() {
             }
         } catch (e: Exception) {
         }
-        showToast("📋", "Copied", preview.replace("\n", " "))
+        showToast(GlyphView.CLIP, "Copied", preview.replace("\n", " "))
     }
 
     private fun onRinger() {
         updateQuickIcons()
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         when (am.ringerMode) {
-            AudioManager.RINGER_MODE_SILENT -> showToast("🔕", "Silent", "")
-            AudioManager.RINGER_MODE_VIBRATE -> showToast("📳", "Vibrate", "")
-            else -> showToast("🔔", "Sound on", "")
+            AudioManager.RINGER_MODE_SILENT -> showToast(GlyphView.MUTE, "Silent", "")
+            AudioManager.RINGER_MODE_VIBRATE -> showToast(GlyphView.VIBRATE, "Vibrate", "")
+            else -> showToast(GlyphView.BELL, "Sound on", "")
         }
     }
 
@@ -1138,12 +1229,12 @@ class IslandService : Service() {
         } else {
             "Disconnected"
         }
-        showToast("🎧", name, sub)
+        showToast(GlyphView.HEADSET, name, sub)
     }
 
-    private fun showBar(icon: String, name: String, value: Float) {
+    private fun showBar(g: Int, name: String, value: Float) {
         if (!barsOn || box == null || hidden || replyMode || busy()) return
-        barIcon?.text = icon
+        barIcon?.glyph = g
         barText?.text = "$name  ${(value * 100).toInt()}%"
         barView?.value = value
         if (event != EVENT_BAR) {
@@ -1174,7 +1265,7 @@ class IslandService : Service() {
 
     private fun showWarn(level: Int) {
         if (box == null || hidden || replyMode || busy()) return
-        warnText = "⚠ Battery low  $level%"
+        warnText = "Battery low  $level%"
         event = EVENT_WARN
         setBigHeight(dp(80))
         handler.removeCallbacks(collapseRunnable)
@@ -1190,7 +1281,8 @@ class IslandService : Service() {
         for (id in cm.cameraIdList) {
             val c = cm.getCameraCharacteristics(id)
             val flash = c.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
-            val back = c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+            val back =
+                c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
             if (flash && back) return id
         }
         return null
@@ -1220,13 +1312,12 @@ class IslandService : Service() {
 
     private fun updateQuickIcons() {
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        qRinger?.text = when (am.ringerMode) {
-            AudioManager.RINGER_MODE_SILENT -> "🔕"
-            AudioManager.RINGER_MODE_VIBRATE -> "📳"
-            else -> "🔔"
+        qRinger?.glyph = when (am.ringerMode) {
+            AudioManager.RINGER_MODE_SILENT -> GlyphView.MUTE
+            AudioManager.RINGER_MODE_VIBRATE -> GlyphView.VIBRATE
+            else -> GlyphView.BELL
         }
-        (qTorch?.background as? GradientDrawable)
-            ?.setColor(Color.parseColor(if (torchOn) "#6A5CFF" else "#33FFFFFF"))
+        qTorch?.filled = torchOn
     }
 
     private fun showQuick() {
@@ -1243,7 +1334,7 @@ class IslandService : Service() {
     private fun openShade() {
         haptic(true)
         if (!ShizukuHelper.hasPermission()) {
-            showToast("ⓘ", "Shizuku needed", "Grant it in the Island app")
+            showToast(GlyphView.INFO, "Shizuku needed", "Grant it in the Island app")
             return
         }
         animateTo(0f)
@@ -1256,6 +1347,12 @@ class IslandService : Service() {
         val cam = camUnavail.isNotEmpty() && !torchOn
         dotCam?.visibility = if (cam) View.VISIBLE else View.GONE
         dotMic?.visibility = if (micActive) View.VISIBLE else View.GONE
+        updateBadges()
+    }
+
+    private fun updateChargeBadge() {
+        chargeBadgeText?.text = "Charging  ${batteryLevel()}%"
+        chargeBadge?.visibility = if (charging) View.VISIBLE else View.GONE
         updateBadges()
     }
 
@@ -1437,7 +1534,7 @@ class IslandService : Service() {
             }
         }
         val dots = dotCam?.visibility == View.VISIBLE || dotMic?.visibility == View.VISIBLE
-        val show = (unseen.isNotEmpty() || dots) && frac < 0.3f && !hidden
+        val show = (unseen.isNotEmpty() || dots || charging) && frac < 0.3f && !hidden
         bb.visibility = if (show) View.VISIBLE else View.GONE
     }
 
@@ -1524,16 +1621,9 @@ class IslandService : Service() {
         }
     }
 
-    private fun circleBtn(emoji: String, onClick: () -> Unit): TextView {
-        return TextView(this).apply {
-            text = emoji
-            textSize = 22f
-            gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#33FFFFFF"))
-            }
+    private fun glyphBtn(g: Int, onClick: () -> Unit): GlyphView {
+        return GlyphView(this, g).apply {
+            shadow = true
             setOnClickListener {
                 haptic()
                 onClick()
@@ -1599,14 +1689,20 @@ class IslandService : Service() {
         }
         bgScrim = bScrim
 
-        // Info / warning text
+        // Info / warning row
+        val iIcon = GlyphView(this, GlyphView.BATTERY)
+        infoIcon = iIcon
         val tv = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 16f
-            gravity = Gravity.CENTER
-            visibility = View.GONE
         }
         label = tv
+        val iRow = hbox(Gravity.CENTER).apply {
+            visibility = View.GONE
+            addView(iIcon, lp(dp(22), dp(22)).apply { marginEnd = dp(8) })
+            addView(tv, lp(WC, WC))
+        }
+        infoRow = iRow
 
         // Charging row
         val cv = ChargeView(this)
@@ -1812,13 +1908,10 @@ class IslandService : Service() {
         alertRow = aCard
 
         // Toast card (Bluetooth, ringer, clipboard)
-        val tIcon = TextView(this).apply {
-            textSize = 24f
-            setTextColor(Color.WHITE)
-        }
+        val tIcon = GlyphView(this, GlyphView.INFO)
+        toastIcon = tIcon
         val tTitle = smallText(15f, "#FFFFFF", true)
         val tSub = smallText(12f, "#D0D4DC", false)
-        toastIcon = tIcon
         toastTitle = tTitle
         toastSub = tSub
         val tCol = vbox().apply {
@@ -1828,15 +1921,15 @@ class IslandService : Service() {
         val tRow = hbox().apply {
             setPadding(dp(22), dp(8), dp(22), dp(8))
             visibility = View.GONE
-            addView(tIcon, lp(WC, WC).apply { marginEnd = dp(14) })
+            addView(tIcon, lp(dp(28), dp(28)).apply { marginEnd = dp(14) })
             addView(tCol, lp(0, WC, 1f))
         }
         toastRow = tRow
 
-        // Quick buttons (long press)
-        val qT = circleBtn("🔦") { toggleTorch() }
-        val qR = circleBtn("🔔") { toggleRinger() }
-        val qS = circleBtn("⚙") {
+        // Quick buttons (long press): no background, just icons
+        val qT = glyphBtn(GlyphView.TORCH) { toggleTorch() }
+        val qR = glyphBtn(GlyphView.BELL) { toggleRinger() }
+        val qS = glyphBtn(GlyphView.GEAR) {
             val i = Intent(this, MainActivity::class.java)
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(i)
@@ -1845,17 +1938,14 @@ class IslandService : Service() {
         qRinger = qR
         val qRow = hbox(Gravity.CENTER).apply {
             visibility = View.GONE
-            addView(qT, lp(dp(52), dp(52)).apply { marginEnd = dp(14) })
-            addView(qR, lp(dp(52), dp(52)).apply { marginEnd = dp(14) })
-            addView(qS, lp(dp(52), dp(52)))
+            addView(qT, lp(dp(42), dp(42)).apply { marginEnd = dp(28) })
+            addView(qR, lp(dp(42), dp(42)).apply { marginEnd = dp(28) })
+            addView(qS, lp(dp(42), dp(42)))
         }
         quickRow = qRow
 
         // Brightness bar
-        val bIcon = TextView(this).apply {
-            textSize = 20f
-            setTextColor(Color.WHITE)
-        }
+        val bIcon = GlyphView(this, GlyphView.SUN)
         barIcon = bIcon
         val bTxt = smallText(14f, "#FFFFFF", true)
         barText = bTxt
@@ -1868,7 +1958,7 @@ class IslandService : Service() {
         val bRow = hbox().apply {
             setPadding(dp(20), dp(8), dp(20), dp(8))
             visibility = View.GONE
-            addView(bIcon, lp(WC, WC).apply { marginEnd = dp(14) })
+            addView(bIcon, lp(dp(26), dp(26)).apply { marginEnd = dp(14) })
             addView(bCol, lp(0, WC, 1f))
         }
         barRow = bRow
@@ -1904,7 +1994,7 @@ class IslandService : Service() {
             outlineProvider = pillOutline
             addView(bArt, FrameLayout.LayoutParams(MP, MP))
             addView(bScrim, FrameLayout.LayoutParams(MP, MP))
-            addView(tv, FrameLayout.LayoutParams(MP, MP))
+            addView(iRow, FrameLayout.LayoutParams(MP, MP))
             addView(cRow, FrameLayout.LayoutParams(MP, MP))
             addView(nRow, FrameLayout.LayoutParams(MP, MP))
             addView(mCard, FrameLayout.LayoutParams(MP, MP))
@@ -1961,7 +2051,8 @@ class IslandService : Service() {
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         wm?.addView(b, wlp)
 
-        // Side badges under the pill: unseen notification icons, privacy dots in the middle
+        // Under the pill: unseen notification icons on the sides,
+        // privacy dots and the charging word in the middle
         val bl = hbox()
         val br = hbox()
         badgeL = bl
@@ -1970,15 +2061,32 @@ class IslandService : Service() {
         val dm = dot("#FF9F0A")
         dotCam = dc
         dotMic = dm
-        val centerDots = hbox(Gravity.CENTER).apply {
+        val cbIcon = GlyphView(this, GlyphView.BOLT).apply {
+            tint = Color.parseColor("#30D158")
+            filled = true
+        }
+        val cbText = TextView(this).apply {
+            textSize = 10f
+            setTextColor(Color.parseColor("#30D158"))
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        chargeBadgeText = cbText
+        val cbBox = hbox(Gravity.CENTER).apply {
+            visibility = View.GONE
+            addView(cbIcon, lp(dp(11), dp(11)))
+            addView(cbText, lp(WC, WC).apply { marginStart = dp(3) })
+        }
+        chargeBadge = cbBox
+        val centerBox = hbox(Gravity.CENTER).apply {
             addView(dc, lp(dp(6), dp(6)).apply { marginEnd = dp(3) })
-            addView(dm, lp(dp(6), dp(6)))
+            addView(dm, lp(dp(6), dp(6)).apply { marginEnd = dp(3) })
+            addView(cbBox, lp(WC, WC))
         }
         val bb = FrameLayout(this).apply {
             visibility = View.GONE
             addView(bl, FrameLayout.LayoutParams(WC, MP, Gravity.START or Gravity.CENTER_VERTICAL))
             addView(br, FrameLayout.LayoutParams(WC, MP, Gravity.END or Gravity.CENTER_VERTICAL))
-            addView(centerDots, FrameLayout.LayoutParams(WC, MP, Gravity.CENTER))
+            addView(centerBox, FrameLayout.LayoutParams(WC, MP, Gravity.CENTER))
         }
         badgeBox = bb
         val bp = WindowManager.LayoutParams(
@@ -2000,6 +2108,7 @@ class IslandService : Service() {
         renderPage()
         refreshMusicViews()
         updatePrivacy()
+        updateChargeBadge()
         applyHidden()
 
         handler.removeCallbacks(fgPoll)
@@ -2234,7 +2343,7 @@ class IslandService : Service() {
 
     private fun showOnly(which: View?) {
         val all = listOf<View?>(
-            label, chargeRow, musicCard, notifRow, alertRow, toastRow, quickRow, barRow
+            infoRow, chargeRow, musicCard, notifRow, alertRow, toastRow, quickRow, barRow
         )
         for (v in all) {
             v?.visibility = if (v != null && v === which) View.VISIBLE else View.GONE
@@ -2243,7 +2352,9 @@ class IslandService : Service() {
 
     private fun applyTint() {
         var c = basePillColor
-        if (matchColors) {
+        if (event == EVENT_QUICK) {
+            c = Color.TRANSPARENT
+        } else if (matchColors) {
             var t: Int? = null
             if (event == EVENT_PAGE) {
                 val pg = pageAt(curPage)
@@ -2322,13 +2433,16 @@ class IslandService : Service() {
             EVENT_QUICK -> showOnly(quickRow)
             EVENT_BAR -> showOnly(barRow)
             EVENT_WARN -> {
-                showOnly(label)
+                showOnly(infoRow)
+                infoIcon?.glyph = GlyphView.WARN
+                infoIcon?.filled = false
+                infoIcon?.tint = Color.parseColor("#FF6B6B")
                 label?.text = warnText
                 label?.setTextColor(Color.parseColor("#FF6B6B"))
             }
             else -> {
-                val first = label?.visibility != View.VISIBLE
-                showOnly(label)
+                val first = infoRow?.visibility != View.VISIBLE
+                showOnly(infoRow)
                 if (first) showInfo()
             }
         }
@@ -2336,14 +2450,17 @@ class IslandService : Service() {
 
     private fun showInfo() {
         val level = batteryLevel()
+        infoIcon?.glyph = if (charging) GlyphView.BOLT else GlyphView.BATTERY
+        infoIcon?.filled = charging
+        infoIcon?.tint = if (charging) Color.parseColor("#30D158") else Color.WHITE
         label?.setTextColor(Color.WHITE)
         label?.text = if (charging) {
-            "⚡ Charging   $level%"
+            "Charging   $level%"
         } else {
             val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
-            "🔋 $level%   •   $time"
+            "$level%   •   $time"
         }
-        label?.visibility = View.VISIBLE
+        infoRow?.visibility = View.VISIBLE
     }
 
     private fun removePill() {
@@ -2365,6 +2482,8 @@ class IslandService : Service() {
         bg = null
         bgArt = null
         bgScrim = null
+        infoRow = null
+        infoIcon = null
         label = null
         chargeRow = null
         chargeView = null
@@ -2414,13 +2533,15 @@ class IslandService : Service() {
         badgeR = null
         dotCam = null
         dotMic = null
+        chargeBadge = null
+        chargeBadgeText = null
     }
 
     override fun onDestroy() {
         instance = null
         handler.removeCallbacks(ticker)
         removePill()
-        controller?.unregisterCallback(mediaCallback)
+        clearControllers()
         controller = null
         try {
             msm?.removeOnActiveSessionsChangedListener(sessionsListener)
