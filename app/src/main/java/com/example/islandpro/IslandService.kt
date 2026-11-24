@@ -627,7 +627,7 @@ private fun playDefaultNotificationSound() {
 
     } catch (_: Exception) {
         // Ignore sound errors
-    
+    }
 }
     fun onNotification(sbn: StatusBarNotification) {
         if (sbn.packageName == packageName) return
