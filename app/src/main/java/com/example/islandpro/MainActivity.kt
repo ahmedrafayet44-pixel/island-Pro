@@ -302,10 +302,46 @@ class MainActivity : Activity() {
             setPadding(0, dp(20), 0, 0)
         })
 
-        setContentView(ScrollView(this).apply {
-            setBackgroundColor(bgColor)
-            addView(root)
-        })
+        val scrollView = ScrollView(this).apply {
+    setBackgroundColor(bgColor)
+    addView(root)
+}
+
+val screen = android.widget.FrameLayout(this).apply {
+    setBackgroundColor(bgColor)
+
+    addView(
+        scrollView,
+        android.widget.FrameLayout.LayoutParams(
+            android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+            android.widget.FrameLayout.LayoutParams.MATCH_PARENT
+        )
+    )
+
+    addView(TextView(this@MainActivity).apply {
+        text = "("
+        textSize = 36f
+        setTextColor(Color.WHITE)
+        gravity = Gravity.CENTER
+        includeFontPadding = false
+        isClickable = false
+    }, android.widget.FrameLayout.LayoutParams(
+        dp(26), dp(64), Gravity.CENTER_VERTICAL or Gravity.START
+    ))
+
+    addView(TextView(this@MainActivity).apply {
+        text = ")"
+        textSize = 36f
+        setTextColor(Color.WHITE)
+        gravity = Gravity.CENTER
+        includeFontPadding = false
+        isClickable = false
+    }, android.widget.FrameLayout.LayoutParams(
+        dp(26), dp(64), Gravity.CENTER_VERTICAL or Gravity.END
+    ))
+}
+
+setContentView(screen)
 
         val req = ArrayList<String>()
         if (Build.VERSION.SDK_INT >= 33) req.add("android.permission.POST_NOTIFICATIONS")
