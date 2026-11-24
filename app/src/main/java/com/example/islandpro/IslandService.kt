@@ -2361,6 +2361,7 @@ private fun removeSideAccents() {
             if (v.isAttachedToWindow) wm?.updateViewLayout(v, wlp)
         }
         updateBadges()
+        updateSideAccents()
     }
 
     // ---------- Touch (iPhone style: grows, follows the finger, springs back) ----------
