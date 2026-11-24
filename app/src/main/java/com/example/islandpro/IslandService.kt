@@ -32,6 +32,7 @@ import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
+import android.media.RingtoneManager
 import android.media.AudioRecordingConfiguration
 import android.media.MediaMetadata
 import android.media.session.MediaController
@@ -607,7 +608,27 @@ class IslandService : Service() {
         }
         return if (out.size > 3) out.subList(out.size - 3, out.size).toList() else out
     }
+private fun playDefaultNotificationSound() {
+    try {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
+        if (audioManager.ringerMode != AudioManager.RINGER_MODE_NORMAL) return
+
+        val soundUri = RingtoneManager.getDefaultUri(
+            RingtoneManager.TYPE_NOTIFICATION
+        ) ?: return
+
+        val ringtone = RingtoneManager.getRingtone(
+            applicationContext,
+            soundUri
+        ) ?: return
+
+        ringtone.play()
+
+    } catch (_: Exception) {
+        // Ignore sound errors
+    
+}
     fun onNotification(sbn: StatusBarNotification) {
         if (sbn.packageName == packageName) return
         val n = sbn.notification ?: return
@@ -683,7 +704,7 @@ class IslandService : Service() {
             }
             return
         }
-
+playDefaultNotificationSound()
         notifs.removeAll { it.key == item.key }
         notifs.add(0, item)
         while (notifs.size > 15) notifs.removeAt(notifs.size - 1)
