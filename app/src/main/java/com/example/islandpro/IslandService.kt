@@ -2,6 +2,7 @@ package com.example.islandpro
 
 import android.animation.TimeInterpolator
 import android.animation.ValueAnimator
+import android.app.ActivityOptions
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -32,7 +33,6 @@ import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
-import android.media.RingtoneManager
 import android.media.AudioRecordingConfiguration
 import android.media.MediaMetadata
 import android.media.session.MediaController
@@ -94,6 +94,7 @@ internal class NotifItem(
     val pkg: String,
     val appName: String,
     val icon: Bitmap?,
+    val mono: Bitmap?,
     val title: String,
     val lines: List<String>,
     val time: Long,
@@ -102,7 +103,10 @@ internal class NotifItem(
     val live: Boolean,
     val progress: Int,
     val progressMax: Int,
-    val tint: Int?
+    val tint: Int?,
+    val chrono: Boolean,
+    val chronoWhen: Long,
+    val chronoDown: Boolean
 ) {
     var viewed = false
 }
@@ -124,7 +128,7 @@ internal class AlertItem(
     val startMs: Long
 )
 
-// kind: 0 music, 1 notification, 2 live progress, 3 ongoing call
+// kind: 0 music, 1 notification, 2 live / ongoing, 3 ongoing call
 internal class Page(val kind: Int, val item: NotifItem?)
 
 class IslandService : Service() {
@@ -205,8 +209,8 @@ class IslandService : Service() {
     private var barView: BarView? = null
     private var strip: LinearLayout? = null
     private var badgeBox: FrameLayout? = null
-    private var badgeL: LinearLayout? = null
-    private var badgeR: LinearLayout? = null
+    private var winL: FrameLayout? = null
+    private var winR: FrameLayout? = null
     private var dotCam: View? = null
     private var dotMic: View? = null
     private var chargeBadge: LinearLayout? = null
@@ -214,11 +218,19 @@ class IslandService : Service() {
     private var params: WindowManager.LayoutParams? = null
     private var animator: ValueAnimator? = null
     private var heightAnim: ValueAnimator? = null
+    private var springAnim: ValueAnimator? = null
+    private var pressAnim: ValueAnimator? = null
 
     private var smallW = 0
     private var smallH = 0
     private var bigW = 0
     private var bigH = 0
+    private var baseX = 0
+    private var baseTop = 0
+    private var yShift = 0
+    private var dragX = 0f
+    private var dragY = 0f
+    private var pressScale = 1f
     private var frac = 0f
     private var targetFrac = 0f
     private var cornerPx = 0f
@@ -280,11 +292,23 @@ class IslandService : Service() {
 
     private val ticker = object : Runnable {
         override fun run() {
-            val o = ongoing ?: return
-            val t = fmtElapsed(System.currentTimeMillis() - o.startMs)
-            compactTimer?.text = t
-            if (alertRow?.visibility == View.VISIBLE && event != EVENT_ALERT) {
-                alertSub?.text = "Call • $t"
+            val o = ongoing
+            val c = lives.firstOrNull { it.chrono }
+            if (o == null && c == null) return
+            val tv = compactTimer
+            if (o != null) {
+                tv?.text = fmtElapsed(System.currentTimeMillis() - o.startMs)
+                tv?.setTextColor(Color.parseColor("#30D158"))
+            } else if (c != null) {
+                tv?.text = chronoText(c)
+                tv?.setTextColor(Color.parseColor("#FF9F0A"))
+            }
+            if (o != null && alertRow?.visibility == View.VISIBLE && event != EVENT_ALERT) {
+                alertSub?.text = "Call • " + fmtElapsed(System.currentTimeMillis() - o.startMs)
+            }
+            val cur = pageAt(curPage)?.item
+            if (event == EVENT_PAGE && cur != null && cur.chrono) {
+                notifText?.text = chronoText(cur)
             }
             handler.postDelayed(this, 1000)
         }
@@ -470,6 +494,11 @@ class IslandService : Service() {
         }
     }
 
+    private fun popupsHidden(): Boolean {
+        val prefs = getSharedPreferences("island", Context.MODE_PRIVATE)
+        return prefs.getBoolean("hide_popups", true) && ShizukuHelper.hasPermission()
+    }
+
     // ---------- Helpers ----------
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -507,6 +536,17 @@ class IslandService : Service() {
         } else {
             String.format(Locale.US, "%02d:%02d", m, sec)
         }
+    }
+
+    private fun chronoText(i: NotifItem): String {
+        val now = System.currentTimeMillis()
+        val ms = if (i.chronoDown) i.chronoWhen - now else now - i.chronoWhen
+        return fmtElapsed(ms)
+    }
+
+    private fun startTicker() {
+        handler.removeCallbacks(ticker)
+        handler.post(ticker)
     }
 
     private fun haptic(strong: Boolean = false) {
@@ -547,11 +587,26 @@ class IslandService : Service() {
         }
     }
 
-    private fun sendPi(pi: PendingIntent) {
-        try {
-            pi.send()
+    // Sends a PendingIntent with permission to open an activity from the background
+    private fun fire(pi: PendingIntent): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                val o = ActivityOptions.makeBasic()
+                o.setPendingIntentBackgroundActivityStartMode(
+                    ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED
+                )
+                pi.send(this, 0, null, null, null, null, o.toBundle())
+            } else {
+                pi.send()
+            }
+            true
         } catch (e: Exception) {
+            false
         }
+    }
+
+    private fun sendPi(pi: PendingIntent) {
+        fire(pi)
     }
 
     private fun launchApp(pkg: String?) {
@@ -608,39 +663,20 @@ class IslandService : Service() {
         }
         return if (out.size > 3) out.subList(out.size - 3, out.size).toList() else out
     }
-private fun playDefaultNotificationSound() {
-    try {
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-        if (audioManager.ringerMode != AudioManager.RINGER_MODE_NORMAL) return
-
-        val soundUri = RingtoneManager.getDefaultUri(
-            RingtoneManager.TYPE_NOTIFICATION
-        ) ?: return
-
-        val ringtone = RingtoneManager.getRingtone(
-            applicationContext,
-            soundUri
-        ) ?: return
-
-        ringtone.play()
-
-    } catch (_: Exception) {
-        // Ignore sound errors
-    }
-}
     fun onNotification(sbn: StatusBarNotification) {
         if (sbn.packageName == packageName) return
         val n = sbn.notification ?: return
         val ex = n.extras ?: return
         val cat = n.category
+        val chrono = ex.getBoolean(Notification.EXTRA_SHOW_CHRONOMETER, false)
 
         if (cat == Notification.CATEGORY_CALL) {
             if (handleCall(sbn, n, ex)) return
         }
-        val acts0 = n.actions
-        if (cat == Notification.CATEGORY_ALARM) {
-            if (acts0 != null && acts0.isNotEmpty()) handleAlarm(sbn, n, ex)
+        if (cat == Notification.CATEGORY_ALARM && !chrono) {
+            val a = n.actions
+            if (a != null && a.isNotEmpty()) handleAlarm(sbn, n, ex)
             return
         }
 
@@ -648,22 +684,26 @@ private fun playDefaultNotificationSound() {
         val blocked = prefs.getStringSet("blocked_apps", null)
         if (blocked != null && blocked.contains(sbn.packageName)) return
         if ((n.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
-        if (n.fullScreenIntent != null) return
-        if (cat == Notification.CATEGORY_TRANSPORT ||
-            cat == Notification.CATEGORY_SERVICE ||
-            cat == Notification.CATEGORY_NAVIGATION
-        ) return
         val template = ex.getString(Notification.EXTRA_TEMPLATE) ?: ""
         if (template.contains("MediaStyle")) return
+        if (cat == Notification.CATEGORY_TRANSPORT) return
 
         val pmax = ex.getInt(Notification.EXTRA_PROGRESS_MAX, 0)
-        val live = pmax > 0
         val ongoingFlag = (n.flags and Notification.FLAG_ONGOING_EVENT) != 0
-        if (ongoingFlag && !live) return
+        val live = pmax > 0 || ongoingFlag || chrono
+        if (!live && n.fullScreenIntent != null) return
 
-        val title = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
+        val pm = packageManager
+        val appName = try {
+            pm.getApplicationLabel(pm.getApplicationInfo(sbn.packageName, 0)).toString()
+        } catch (e: Exception) {
+            sbn.packageName
+        }
+        var title = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
         val lines = extractLines(ex)
-        if (title.isEmpty() && lines.isEmpty()) return
+        if (title.isEmpty() && lines.isEmpty()) {
+            if (live) title = appName else return
+        }
         val progress = ex.getInt(Notification.EXTRA_PROGRESS, 0)
 
         if (!live && prefs.getBoolean("hide_sys", false)) {
@@ -675,19 +715,20 @@ private fun playDefaultNotificationSound() {
         if (seen.size > 100) seen.clear()
         seen[sbn.key] = sig
 
-        val pm = packageManager
-        val appName = try {
-            pm.getApplicationLabel(pm.getApplicationInfo(sbn.packageName, 0)).toString()
-        } catch (e: Exception) {
-            sbn.packageName
-        }
         val icon = appIcon(sbn.packageName)
+        val mono = try {
+            val d = n.smallIcon?.loadDrawable(this)
+            if (d != null) drawableToBitmap(d, dp(32)) else null
+        } catch (e: Exception) {
+            null
+        }
 
         val item = NotifItem(
-            sbn.key, sbn.packageName, appName, icon,
+            sbn.key, sbn.packageName, appName, icon, mono,
             title, lines, sbn.postTime, n.contentIntent,
             if (live) null else findReplyAction(n),
-            live, progress, pmax, avgColor(icon)
+            live, progress, pmax, avgColor(icon),
+            chrono, n.`when`, ex.getBoolean("android.chronometerCountDown", false)
         )
 
         if (live) {
@@ -696,15 +737,16 @@ private fun playDefaultNotificationSound() {
                 lives[idx] = item
             } else {
                 lives.add(0, item)
-                while (lives.size > 5) lives.removeAt(lives.size - 1)
+                while (lives.size > 8) lives.removeAt(lives.size - 1)
             }
+            if (chrono) startTicker()
             if (box != null) {
                 renderPage()
                 renderContent()
             }
             return
         }
-playDefaultNotificationSound()
+
         notifs.removeAll { it.key == item.key }
         notifs.add(0, item)
         while (notifs.size > 15) notifs.removeAt(notifs.size - 1)
@@ -723,7 +765,6 @@ playDefaultNotificationSound()
         if (alert?.key == sbn.key) endAlert()
         if (ongoing?.key == sbn.key) {
             ongoing = null
-            compactTimer?.visibility = View.GONE
             if (box != null) {
                 renderPage()
                 renderContent()
@@ -758,28 +799,22 @@ playDefaultNotificationSound()
     private fun openItem(item: NotifItem) {
         var ok = false
         val pi = item.contentIntent
-        if (pi != null) {
-            try {
-                pi.send()
-                ok = true
-            } catch (e: Exception) {
-            }
-        }
+        if (pi != null) ok = fire(pi)
         if (!ok) launchApp(item.pkg)
         notifs.remove(item)
         lives.remove(item)
     }
 
+    private fun openBadge(item: NotifItem) {
+        openItem(item)
+        renderPage()
+        updateBadges()
+    }
+
     private fun openMusicApp() {
         val c = controller ?: return
         val pi = c.sessionActivity
-        if (pi != null) {
-            try {
-                pi.send()
-                return
-            } catch (e: Exception) {
-            }
-        }
+        if (pi != null && fire(pi)) return
         launchApp(c.packageName)
     }
 
@@ -842,14 +877,15 @@ playDefaultNotificationSound()
         val mode = am.mode
         val ct = ex.getInt("android.callType", 0)
         val chrono = ex.getBoolean(Notification.EXTRA_SHOW_CHRONOMETER, false)
-        val incoming = ct == 1 ||
-            (ct == 0 && (n.fullScreenIntent != null || mode == AudioManager.MODE_RINGTONE))
-        val inCall = !incoming && (
-            ct == 2 || (ct == 0 && (
-                chrono || mode == AudioManager.MODE_IN_CALL ||
-                    mode == AudioManager.MODE_IN_COMMUNICATION
-                ))
-            )
+        val ongoingFlag = (n.flags and Notification.FLAG_ONGOING_EVENT) != 0
+        val inCallMode = mode == AudioManager.MODE_IN_CALL ||
+            mode == AudioManager.MODE_IN_COMMUNICATION
+        val incoming = ct == 1 || (ct == 0 && (
+            n.fullScreenIntent != null ||
+                mode == AudioManager.MODE_RINGTONE ||
+                (ongoingFlag && !chrono && !inCallMode)
+            ))
+        val inCall = !incoming && (ct == 2 || (ct == 0 && (chrono || inCallMode)))
         if (!incoming && !inCall) return false
 
         val title = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
@@ -913,8 +949,7 @@ playDefaultNotificationSound()
             alert = null
             if (event == EVENT_ALERT) animateTo(0f)
         }
-        handler.removeCallbacks(ticker)
-        handler.post(ticker)
+        startTicker()
         if (box != null) {
             renderPage()
             renderContent()
@@ -960,6 +995,9 @@ playDefaultNotificationSound()
         bindAlert(a)
         handler.removeCallbacks(collapseRunnable)
         if (replyMode) exitReply()
+        // When the phone's own banner is not hidden it sits on top of the pill,
+        // so the card is moved just below the banner to stay tappable
+        yShift = if (popupsHidden()) 0 else dp(136)
         event = EVENT_ALERT
         setBigHeight(dp(124))
         haptic(true)
@@ -984,10 +1022,10 @@ playDefaultNotificationSound()
         if (a == null) return
         if (a.kind == 0) {
             // left = Decline, right = Accept
-            if (!telecomAnswer(!left)) {
-                val pi = if (left) a.left else a.right
-                if (pi != null) sendPi(pi)
-            }
+            val accept = !left
+            val done = telecomAnswer(accept)
+            val pi = if (left) a.left else a.right
+            if (pi != null && (accept || !done)) sendPi(pi)
             alert = null
         } else if (a.kind == 2) {
             if (left) {
@@ -1461,15 +1499,15 @@ playDefaultNotificationSound()
     private fun bindItem(item: NotifItem) {
         val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(item.time))
         notifApp?.text =
-            if (item.live) "${item.appName}  •  In progress" else "${item.appName}  •  $time"
+            if (item.live) "${item.appName}  •  Ongoing" else "${item.appName}  •  $time"
         notifTitle?.text = item.title
-        notifText?.text = item.lines.joinToString("\n")
+        notifText?.text =
+            if (item.chrono) chronoText(item) else item.lines.joinToString("\n")
         notifText?.maxLines = if (item.live) 1 else 3
         notifIcon?.setImageBitmap(item.icon)
-        notifBar?.visibility = if (item.live) View.VISIBLE else View.GONE
-        if (item.live) {
-            notifBar?.value =
-                if (item.progressMax > 0) item.progress / item.progressMax.toFloat() else 0f
+        notifBar?.visibility = if (item.live && item.progressMax > 0) View.VISIBLE else View.GONE
+        if (item.live && item.progressMax > 0) {
+            notifBar?.value = item.progress / item.progressMax.toFloat()
         }
         notifBtnRow?.visibility = if (!item.live && !replyMode) View.VISIBLE else View.GONE
         replyBtn?.visibility = if (item.replyAction != null) View.VISIBLE else View.GONE
@@ -1491,15 +1529,24 @@ playDefaultNotificationSound()
         updateBadges()
     }
 
-    private fun smallIcon(bmp: Bitmap?, ratio: Float): ImageView {
+    // White One UI style status icon (falls back to the coloured app icon)
+    private fun statusIcon(item: NotifItem): ImageView {
         return ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            clipToOutline = true
-            outlineProvider = roundOutline(ratio)
-            if (bmp != null) {
-                setImageBitmap(bmp)
+            val m = item.mono
+            if (m != null) {
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                setImageBitmap(m)
+                setColorFilter(Color.WHITE)
             } else {
-                setBackgroundColor(Color.parseColor("#6A5CFF"))
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                clipToOutline = true
+                outlineProvider = roundOutline(0.3f)
+                val ic = item.icon
+                if (ic != null) {
+                    setImageBitmap(ic)
+                } else {
+                    setBackgroundColor(Color.parseColor("#6A5CFF"))
+                }
             }
         }
     }
@@ -1520,7 +1567,7 @@ playDefaultNotificationSound()
         for ((pkg, item) in byApp) {
             if (count >= 7) break
             val cur = pkg == curPkg
-            val iv = smallIcon(item.icon, 0.28f)
+            val iv = statusIcon(item)
             iv.alpha = if (cur) 1f else 0.5f
             val size = if (cur) dp(16) else dp(13)
             s.addView(iv, lp(size, size).apply {
@@ -1531,32 +1578,85 @@ playDefaultNotificationSound()
         }
     }
 
+    private fun removeSideWindows() {
+        winL?.let {
+            if (it.isAttachedToWindow) wm?.removeView(it)
+        }
+        winR?.let {
+            if (it.isAttachedToWindow) wm?.removeView(it)
+        }
+        winL = null
+        winR = null
+    }
+
+    private fun sideWindow(items: List<NotifItem>, left: Boolean): FrameLayout? {
+        if (items.isEmpty()) return null
+        val row = hbox(Gravity.CENTER)
+        for (item in items) {
+            val iv = statusIcon(item)
+            iv.setOnClickListener {
+                haptic()
+                openBadge(item)
+            }
+            row.addView(iv, lp(dp(16), dp(16)).apply {
+                marginStart = dp(2)
+                marginEnd = dp(2)
+            })
+        }
+        val holder = FrameLayout(this).apply {
+            addView(row, FrameLayout.LayoutParams(WC, MP, Gravity.CENTER))
+        }
+        val w = items.size * dp(20)
+        val p = WindowManager.LayoutParams(
+            w,
+            dp(26),
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            x = baseX + if (left) -(smallW / 2) + w / 2 else (smallW / 2) - w / 2
+            y = baseTop + smallH
+        }
+        wm?.addView(holder, p)
+        return holder
+    }
+
     private fun updateBadges() {
-        val bb = badgeBox ?: return
+        if (box == null) return
         val unseen = LinkedHashMap<String, NotifItem>()
         for (n in notifs) {
             if (!n.viewed && !unseen.containsKey(n.pkg)) unseen[n.pkg] = n
         }
-        val sig = unseen.keys.joinToString(",")
+        val showSides = unseen.isNotEmpty() && frac < 0.3f && !hidden
+        val sig = if (showSides) unseen.keys.joinToString(",") else ""
         if (sig != badgeSig) {
             badgeSig = sig
-            badgeL?.removeAllViews()
-            badgeR?.removeAllViews()
-            var i = 0
-            for ((_, item) in unseen) {
-                if (i >= 8) break
-                val iv = smallIcon(item.icon, 0.3f)
-                val target = if (i % 2 == 0) badgeL else badgeR
-                target?.addView(iv, lp(dp(14), dp(14)).apply {
-                    marginStart = dp(2)
-                    marginEnd = dp(2)
-                })
-                i++
+            removeSideWindows()
+            if (showSides) {
+                val leftItems = ArrayList<NotifItem>()
+                val rightItems = ArrayList<NotifItem>()
+                var i = 0
+                for ((_, item) in unseen) {
+                    if (i >= 8) break
+                    if (i % 2 == 0) leftItems.add(item) else rightItems.add(item)
+                    i++
+                }
+                winL = sideWindow(leftItems, true)
+                winR = sideWindow(rightItems, false)
             }
         }
-        val dots = dotCam?.visibility == View.VISIBLE || dotMic?.visibility == View.VISIBLE
-        val show = (unseen.isNotEmpty() || dots || charging) && frac < 0.3f && !hidden
-        bb.visibility = if (show) View.VISIBLE else View.GONE
+        val bb = badgeBox
+        if (bb != null) {
+            val dots = dotCam?.visibility == View.VISIBLE || dotMic?.visibility == View.VISIBLE
+            bb.visibility = if ((dots || charging) && frac < 0.3f && !hidden) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
+        }
     }
 
     private fun changePage(dir: Int) {
@@ -1670,6 +1770,12 @@ playDefaultNotificationSound()
         smallH = dp(prefs.getInt("h", 34))
         val top = dp(prefs.getInt("top", 8))
         val offsetX = dp(prefs.getInt("x", 0))
+        baseX = offsetX
+        baseTop = top
+        yShift = 0
+        dragX = 0f
+        dragY = 0f
+        pressScale = 1f
         hapticOn = prefs.getBoolean("haptic", true)
         barsOn = prefs.getBoolean("show_bright", false)
         hideLand = prefs.getBoolean("hide_land", true)
@@ -2072,12 +2178,7 @@ playDefaultNotificationSound()
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         wm?.addView(b, wlp)
 
-        // Under the pill: unseen notification icons on the sides,
-        // privacy dots and the charging word in the middle
-        val bl = hbox()
-        val br = hbox()
-        badgeL = bl
-        badgeR = br
+        // Middle strip under the pill: privacy dots and the charging word
         val dc = dot("#30D158")
         val dm = dot("#FF9F0A")
         dotCam = dc
@@ -2105,13 +2206,11 @@ playDefaultNotificationSound()
         }
         val bb = FrameLayout(this).apply {
             visibility = View.GONE
-            addView(bl, FrameLayout.LayoutParams(WC, MP, Gravity.START or Gravity.CENTER_VERTICAL))
-            addView(br, FrameLayout.LayoutParams(WC, MP, Gravity.END or Gravity.CENTER_VERTICAL))
             addView(centerBox, FrameLayout.LayoutParams(WC, MP, Gravity.CENTER))
         }
         badgeBox = bb
         val bp = WindowManager.LayoutParams(
-            smallW,
+            WindowManager.LayoutParams.WRAP_CONTENT,
             dp(18),
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -2134,10 +2233,7 @@ playDefaultNotificationSound()
 
         handler.removeCallbacks(fgPoll)
         if (hideApps.isNotEmpty()) handler.post(fgPoll)
-        if (ongoing != null) {
-            handler.removeCallbacks(ticker)
-            handler.post(ticker)
-        }
+        if (ongoing != null || lives.any { it.chrono }) startTicker()
     }
 
     private fun applyHidden() {
@@ -2158,7 +2254,43 @@ playDefaultNotificationSound()
         updateBadges()
     }
 
-    // ---------- Touch ----------
+    // ---------- Touch (iPhone style: grows, follows the finger, springs back) ----------
+
+    private fun rubber(v: Float, lim: Float): Float {
+        val s = v / lim
+        return lim * s / (1f + abs(s))
+    }
+
+    private fun animatePress(target: Float) {
+        pressAnim?.cancel()
+        pressAnim = ValueAnimator.ofFloat(pressScale, target).apply {
+            duration = 160
+            addUpdateListener {
+                pressScale = it.animatedValue as Float
+                applyLayout()
+            }
+            start()
+        }
+    }
+
+    private fun springBack() {
+        springAnim?.cancel()
+        animatePress(1f)
+        val sx = dragX
+        val sy = dragY
+        if (sx == 0f && sy == 0f) return
+        springAnim = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 520
+            interpolator = OvershootInterpolator(2.6f)
+            addUpdateListener { a ->
+                val t = a.animatedValue as Float
+                dragX = sx * (1f - t)
+                dragY = sy * (1f - t)
+                applyLayout()
+            }
+            start()
+        }
+    }
 
     private fun isOnStrip(x: Float, y: Float): Boolean {
         val s = strip ?: return false
@@ -2177,30 +2309,40 @@ playDefaultNotificationSound()
                 return false
             }
             MotionEvent.ACTION_DOWN -> {
-                downX = ev.x
-                downY = ev.y
+                downX = ev.rawX
+                downY = ev.rawY
                 lpFired = false
                 downOnStrip = isOnStrip(ev.x, ev.y)
                 if (targetFrac == 1f && !replyMode) handler.removeCallbacks(collapseRunnable)
                 if (frac < 0.5f && event == EVENT_NONE && !hidden) {
                     handler.postDelayed(longPress, 450)
                 }
+                springAnim?.cancel()
+                if (!replyMode) animatePress(1.04f)
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
-                if (abs(ev.x - downX) > dp(12) || abs(ev.y - downY) > dp(12)) {
+                val dx = ev.rawX - downX
+                val dy = ev.rawY - downY
+                if (abs(dx) > dp(12) || abs(dy) > dp(12)) {
                     handler.removeCallbacks(longPress)
+                }
+                if (!replyMode) {
+                    dragX = rubber(dx, dp(40).toFloat())
+                    dragY = rubber(dy, dp(32).toFloat())
+                    applyLayout()
                 }
                 return true
             }
             MotionEvent.ACTION_UP -> {
                 handler.removeCallbacks(longPress)
+                springBack()
                 if (lpFired) {
                     lpFired = false
                     return true
                 }
-                val dx = ev.x - downX
-                val dy = ev.y - downY
+                val dx = ev.rawX - downX
+                val dy = ev.rawY - downY
                 val horiz = abs(dx) > dp(36) && abs(dx) > abs(dy) * 1.3f
                 val up = dy < -dp(40) && abs(dy) > abs(dx) * 1.3f
                 val down = dy > dp(40) && abs(dy) > abs(dx) * 1.3f
@@ -2220,6 +2362,7 @@ playDefaultNotificationSound()
             }
             MotionEvent.ACTION_CANCEL -> {
                 handler.removeCallbacks(longPress)
+                springBack()
                 if (targetFrac == 1f && !replyMode && event != EVENT_ALERT) {
                     scheduleCollapse(collapseDelay())
                 }
@@ -2353,8 +2496,10 @@ playDefaultNotificationSound()
 
     private fun applyLayout() {
         val wlp = params ?: return
-        wlp.width = (smallW + (bigW - smallW) * frac).toInt()
-        wlp.height = (smallH + (bigH - smallH) * frac).toInt()
+        wlp.width = ((smallW + (bigW - smallW) * frac) * pressScale).toInt()
+        wlp.height = ((smallH + (bigH - smallH) * frac) * pressScale).toInt()
+        wlp.x = baseX + dragX.toInt()
+        wlp.y = baseTop + yShift + dragY.toInt()
         cornerPx = minOf(wlp.height / 2f, dp(34).toFloat())
         bg?.cornerRadius = cornerPx
         val v = box ?: return
@@ -2396,6 +2541,7 @@ playDefaultNotificationSound()
     private fun renderContent() {
         if (targetFrac == 0f && frac < 0.3f && event != EVENT_NONE) {
             event = EVENT_NONE
+            yShift = 0
             chargeView?.stop()
             exitReply()
         }
@@ -2407,14 +2553,14 @@ playDefaultNotificationSound()
         }
         applyTint()
 
-        val calling = ongoing != null
+        val timerOn = ongoing != null || lives.any { it.chrono }
         val showCompact = frac < 0.3f && event == EVENT_NONE && !hidden
         compactArt?.visibility =
             if (showCompact && musicPlaying) View.VISIBLE else View.GONE
         compactEq?.visibility =
-            if (showCompact && musicPlaying && !calling) View.VISIBLE else View.GONE
+            if (showCompact && musicPlaying && !timerOn) View.VISIBLE else View.GONE
         compactTimer?.visibility =
-            if (showCompact && calling) View.VISIBLE else View.GONE
+            if (showCompact && timerOn) View.VISIBLE else View.GONE
 
         val kind = if (event == EVENT_PAGE) (pageAt(curPage)?.kind ?: -1) else -1
         val artBg = kind == 0 && musicArt != null
@@ -2490,9 +2636,12 @@ playDefaultNotificationSound()
         handler.removeCallbacks(fgPoll)
         animator?.cancel()
         heightAnim?.cancel()
+        springAnim?.cancel()
+        pressAnim?.cancel()
         chargeView?.stop()
         cardEq?.setActive(false)
         compactEq?.setActive(false)
+        removeSideWindows()
         box?.let {
             if (it.isAttachedToWindow) wm?.removeView(it)
         }
@@ -2550,8 +2699,6 @@ playDefaultNotificationSound()
         barView = null
         strip = null
         badgeBox = null
-        badgeL = null
-        badgeR = null
         dotCam = null
         dotMic = null
         chargeBadge = null
