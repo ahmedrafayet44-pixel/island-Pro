@@ -159,6 +159,10 @@ class IslandService : Service() {
 
     private var wm: WindowManager? = null
     private var box: FrameLayout? = null
+    private var accentLeft: SideAccentView? = null
+private var accentRight: SideAccentView? = null
+private var accentLeftParams: WindowManager.LayoutParams? = null
+private var accentRightParams: WindowManager.LayoutParams? = null
     private var bg: GradientDrawable? = null
     private var bgArt: ImageView? = null
     private var bgScrim: View? = null
@@ -1588,7 +1592,112 @@ class IslandService : Service() {
         winL = null
         winR = null
     }
+private fun addSideAccents() {
+    removeSideAccents()
 
+    val windowManager = wm ?: return
+    val accentW = dp(14)
+    val accentH = dp(42)
+
+    fun makeParams(): WindowManager.LayoutParams {
+        return WindowManager.LayoutParams(
+            accentW,
+            accentH,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        }
+    }
+
+    val leftView = SideAccentView(this, true)
+    val rightView = SideAccentView(this, false)
+
+    val leftParams = makeParams()
+    val rightParams = makeParams()
+
+    accentLeft = leftView
+    accentRight = rightView
+    accentLeftParams = leftParams
+    accentRightParams = rightParams
+
+    try {
+        windowManager.addView(leftView, leftParams)
+        windowManager.addView(rightView, rightParams)
+    } catch (_: Exception) {
+        removeSideAccents()
+        return
+    }
+
+    updateSideAccents()
+}
+
+private fun updateSideAccents() {
+    val windowManager = wm ?: return
+    val wlp = params ?: return
+
+    val visible = frac < 0.3f && !hidden && box != null
+    val accentH = dp(42)
+
+    accentLeft?.visibility =
+        if (visible) View.VISIBLE else View.GONE
+
+    accentRight?.visibility =
+        if (visible) View.VISIBLE else View.GONE
+
+    accentLeftParams?.let {
+        it.x = wlp.x - wlp.width / 2 - dp(10)
+        it.y = wlp.y + (wlp.height - accentH) / 2
+
+        accentLeft?.let { view ->
+            if (view.isAttachedToWindow) {
+                try {
+                    windowManager.updateViewLayout(view, it)
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    accentRightParams?.let {
+        it.x = wlp.x + wlp.width / 2 + dp(10)
+        it.y = wlp.y + (wlp.height - accentH) / 2
+
+        accentRight?.let { view ->
+            if (view.isAttachedToWindow) {
+                try {
+                    windowManager.updateViewLayout(view, it)
+                } catch (_: Exception) {}
+            }
+        }
+    }
+}
+
+private fun removeSideAccents() {
+    accentLeft?.let {
+        if (it.isAttachedToWindow) {
+            try {
+                wm?.removeView(it)
+            } catch (_: Exception) {}
+        }
+    }
+
+    accentRight?.let {
+        if (it.isAttachedToWindow) {
+            try {
+                wm?.removeView(it)
+            } catch (_: Exception) {}
+        }
+    }
+
+    accentLeft = null
+    accentRight = null
+    accentLeftParams = null
+    accentRightParams = null
+}
     private fun sideWindow(items: List<NotifItem>, left: Boolean): FrameLayout? {
         if (items.isEmpty()) return null
         val row = hbox(Gravity.CENTER)
@@ -2177,7 +2286,7 @@ class IslandService : Service() {
 
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         wm?.addView(b, wlp)
-
+        addSideAccents()
         // Middle strip under the pill: privacy dots and the charging word
         val dc = dot("#30D158")
         val dm = dot("#FF9F0A")
@@ -2500,6 +2609,7 @@ class IslandService : Service() {
         wlp.height = ((smallH + (bigH - smallH) * frac) * pressScale).toInt()
         wlp.x = baseX + dragX.toInt()
         wlp.y = baseTop + yShift + dragY.toInt()
+        updateSideAccents()
         cornerPx = minOf(wlp.height / 2f, dp(34).toFloat())
         bg?.cornerRadius = cornerPx
         val v = box ?: return
@@ -2642,6 +2752,7 @@ class IslandService : Service() {
         cardEq?.setActive(false)
         compactEq?.setActive(false)
         removeSideWindows()
+        removeSideAccents()
         box?.let {
             if (it.isAttachedToWindow) wm?.removeView(it)
         }
