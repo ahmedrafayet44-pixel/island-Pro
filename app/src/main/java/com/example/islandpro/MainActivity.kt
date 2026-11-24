@@ -311,6 +311,7 @@ class MainActivity : Activity() {
         if (Build.VERSION.SDK_INT >= 33) req.add("android.permission.POST_NOTIFICATIONS")
         if (Build.VERSION.SDK_INT >= 31) req.add("android.permission.BLUETOOTH_CONNECT")
         if (req.isNotEmpty()) requestPermissions(req.toTypedArray(), 1)
+        req.add("android.permission.ANSWER_PHONE_CALLS")
     }
 
     override fun onResume() {
