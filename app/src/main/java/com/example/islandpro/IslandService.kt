@@ -284,7 +284,8 @@ class IslandService : Service() {
     private var alert: AlertItem? = null
     private var ongoing: AlertItem? = null
     private val seen = HashMap<String, Int>()
-    private val selfCancelled = HashSet<String>()
+private val soundPlayed = HashSet<String>()
+private val selfCancelled = HashSet<String>()
 
     private var torchOn = false
     private var micActive = false
@@ -760,10 +761,14 @@ class IslandService : Service() {
         }
 
         val sig = title.hashCode() * 31 + lines.joinToString("|").hashCode() + progress * 7
-        if (seen[sbn.key] == sig) return
-        if (seen.size > 100) seen.clear()
-        seen[sbn.key] = sig
-        NotificationSound.play(this)
+if (seen[sbn.key] == sig) return
+if (seen.size > 100) seen.clear()
+seen[sbn.key] = sig
+
+// Play sound only once for each notification
+if (soundPlayed.add(sbn.key)) {
+    NotificationSound.play(this)
+}
 
         val icon = appIcon(sbn.packageName)
         val mono = try {
@@ -812,7 +817,8 @@ class IslandService : Service() {
     }
 
     fun onNotificationRemoved(sbn: StatusBarNotification) {
-        seen.remove(sbn.key)
+    seen.remove(sbn.key)
+    soundPlayed.remove(sbn.key)
         if (alert?.key == sbn.key) endAlert()
         if (ongoing?.key == sbn.key) {
             ongoing = null
