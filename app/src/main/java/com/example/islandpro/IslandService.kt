@@ -2955,7 +2955,7 @@ class IslandService : Service() {
             val cam = getSystemService(Context.CAMERA_SERVICE) as CameraManager
             cam.unregisterAvailabilityCallback(camCallback)
             cam.unregisterTorchCallback(torchCallback)
-        } catch (e: Exception{
+        } catch (e: Exception) {
             }
         val prefs = getSharedPreferences("island", Context.MODE_PRIVATE)
         if (prefs.getBoolean("headsup_off", false)) {
