@@ -2830,3 +2830,139 @@ class IslandService : Service() {
         infoIcon?.glyph = if (charging) GlyphView.BOLT else GlyphView.BATTERY
         infoIcon?.filled = charging
         infoIcon?.tint = if (charging) Color.parseColor("#30D158") else Color.WHITE
+        label?.setTextColor(Color.WHITE)
+        label?.text = if (charging) {
+            "Charging   $level%"
+        } else {
+            val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+            "$level%   •   $time"
+        }
+        infoRow?.visibility = View.VISIBLE
+    }
+
+
+    private fun removePill() {
+        handler.removeCallbacks(collapseRunnable)
+        handler.removeCallbacks(longPress)
+        handler.removeCallbacks(fgPoll)
+        animator?.cancel()
+        heightAnim?.cancel()
+        springAnim?.cancel()
+        pressAnim?.cancel()
+        chargeView?.stop()
+        cardEq?.setActive(false)
+        compactEq?.setActive(false)
+        removeSideWindows()
+        glowView?.let {
+            it.stopNow()
+            if (it.isAttachedToWindow) wm?.removeView(it)
+        }
+        glowView = null
+        glowParams = null
+        glowActive = false
+        box?.let {
+            if (it.isAttachedToWindow) wm?.removeView(it)
+        }
+        badgeBox?.let {
+            if (it.isAttachedToWindow) wm?.removeView(it)
+        }
+        box = null
+        bg = null
+        bgArt = null
+        bgScrim = null
+        infoRow = null
+        infoIcon = null
+        label = null
+        chargeRow = null
+        chargeView = null
+        chargeTitle = null
+        chargeLevel = null
+        chargeSub = null
+        musicCard = null
+        cardArt = null
+        cardTitle = null
+        cardArtist = null
+        cardEq = null
+        playBtn = null
+        compactArt = null
+        compactEq = null
+        compactTimer = null
+        notifRow = null
+        notifIcon = null
+        notifApp = null
+        notifTitle = null
+        notifText = null
+        notifBar = null
+        notifBtnRow = null
+        notifInputRow = null
+        notifInput = null
+        replyBtn = null
+        clearBtn = null
+        stackRow = null
+        peekIcons.clear()
+        peekTexts.clear()
+        peekTargets = emptyList()
+        alertRow = null
+        alertIcon = null
+        alertSub = null
+        alertName = null
+        alertLeft = null
+        alertRight = null
+        toastRow = null
+        toastIcon = null
+        toastTitle = null
+        toastSub = null
+        quickRow = null
+        qTorch = null
+        qRinger = null
+        barRow = null
+        barIcon = null
+        barText = null
+        barView = null
+        strip = null
+        badgeBox = null
+        dotCam = null
+        dotMic = null
+        chargeBadge = null
+        chargeBadgeText = null
+    }
+
+    override fun onDestroy() {
+        instance = null
+        handler.removeCallbacks(ticker)
+        removePill()
+        clearControllers()
+        controller = null
+        try {
+            msm?.removeOnActiveSessionsChangedListener(sessionsListener)
+        } catch (e: Exception) {
+        }
+        mediaReady = false
+        try {
+            unregisterReceiver(receiver)
+        } catch (e: Exception) {
+        }
+        try {
+            contentResolver.unregisterContentObserver(brightnessObserver)
+        } catch (e: Exception) {
+        }
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.removePrimaryClipChangedListener(clipListener)
+        } catch (e: Exception) {
+        }
+        try {
+            val cam = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            cam.unregisterAvailabilityCallback(camCallback)
+            cam.unregisterTorchCallback(torchCallback)
+        } catch (e: Exception{
+            }
+        val prefs = getSharedPreferences("island", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("headsup_off", false)) {
+            val ctx = applicationContext
+            Thread { ShizukuHelper.setHeadsUp(ctx, true) }.start()
+        }
+        running = false
+        super.onDestroy()
+    }
+                 }
