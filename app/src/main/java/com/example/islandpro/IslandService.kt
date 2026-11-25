@@ -142,6 +142,8 @@ class IslandService : Service() {
 
         @Volatile
         var instance: IslandService? = null
+
+        const val ACTION_PREVIEW = "com.example.islandpro.PREVIEW_EDGE"
         private const val CHANNEL_ID = "island_min"
         private const val COLLAPSE_DELAY_MS = 1300L
         private const val ANIM_MS = 350L
@@ -190,6 +192,10 @@ class IslandService : Service() {
     private var notifInput: EditText? = null
     private var replyBtn: TextView? = null
     private var clearBtn: TextView? = null
+    private var stackRow: LinearLayout? = null
+    private val peekIcons = ArrayList<ImageView>()
+    private val peekTexts = ArrayList<TextView>()
+    private var peekTargets: List<NotifItem> = emptyList()
     private var alertRow: LinearLayout? = null
     private var alertIcon: ImageView? = null
     private var alertSub: TextView? = null
@@ -215,11 +221,24 @@ class IslandService : Service() {
     private var dotMic: View? = null
     private var chargeBadge: LinearLayout? = null
     private var chargeBadgeText: TextView? = null
+    private var glowView: GlowView? = null
+    private var glowParams: WindowManager.LayoutParams? = null
+    private var glowPad = 0
+    private var glowActive = false
     private var params: WindowManager.LayoutParams? = null
     private var animator: ValueAnimator? = null
     private var heightAnim: ValueAnimator? = null
     private var springAnim: ValueAnimator? = null
     private var pressAnim: ValueAnimator? = null
+
+    private var edgeOn = true
+    private var edgeNotif = true
+    private var edgeCall = true
+    private var edgeC1 = 0xFF3987FF.toInt()
+    private var edgeC2 = 0xFF55D9FF.toInt()
+    private var edgeMs = 2500L
+    private var edgeThick = 3
+    private var edgeGlow = 12
 
     private var smallW = 0
     private var smallH = 0
@@ -457,9 +476,15 @@ class IslandService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startAsForeground()
         running = true
+        val preview = intent?.action == ACTION_PREVIEW
+        if (preview && box != null) {
+            edgeLight(edgeMs)
+            return START_STICKY
+        }
         buildPill()
         setupMedia()
         applyPopupSetting()
+        if (preview) handler.postDelayed({ edgeLight(edgeMs) }, 700)
         return START_STICKY
     }
 
@@ -625,6 +650,30 @@ class IslandService : Service() {
                 event == EVENT_UNPLUG || event == EVENT_QUICK)
     }
 
+    // ---------- Edge Lighting ----------
+
+    private fun edgeLight(duration: Long) {
+        val gv = glowView ?: return
+        if (box == null || hidden) return
+        glowActive = true
+        gv.radius = cornerPx
+        updateGlowLayout()
+        gv.start(duration)
+    }
+
+    private fun updateGlowLayout() {
+        if (!glowActive) return
+        val gv = glowView ?: return
+        val gp = glowParams ?: return
+        val wlp = params ?: return
+        gp.width = wlp.width + 2 * glowPad
+        gp.height = wlp.height + 2 * glowPad
+        gp.x = wlp.x
+        gp.y = wlp.y - glowPad
+        gv.radius = cornerPx
+        if (gv.isAttachedToWindow) wm?.updateViewLayout(gv, gp)
+    }
+
     // ---------- Notifications ----------
 
     private fun findReplyAction(n: Notification): Notification.Action? {
@@ -752,6 +801,7 @@ class IslandService : Service() {
         while (notifs.size > 15) notifs.removeAt(notifs.size - 1)
 
         if (box == null) return
+        if (edgeNotif) edgeLight(edgeMs)
         if (replyMode || busy()) {
             renderPage()
             renderContent()
@@ -1003,6 +1053,7 @@ class IslandService : Service() {
         haptic(true)
         animateTo(1f)
         renderContent()
+        if (edgeCall) edgeLight(6000L)
     }
 
     private fun endAlert() {
@@ -1484,6 +1535,22 @@ class IslandService : Service() {
         if (pg != null && pg.kind == 1) pg.item?.viewed = true
     }
 
+    // Older notifications that peek out behind the current card (the stack)
+    private fun behindItems(): List<NotifItem> {
+        val pg = pageAt(curPage)
+        val cur = pg?.item
+        if (pg == null || pg.kind != 1 || cur == null) return emptyList()
+        val idx = notifs.indexOf(cur)
+        if (idx < 0) return emptyList()
+        val out = ArrayList<NotifItem>()
+        var i = idx + 1
+        while (i < notifs.size && out.size < 2) {
+            out.add(notifs[i])
+            i++
+        }
+        return out
+    }
+
     private fun pageHeight(): Int {
         val extra = if (notifs.isNotEmpty()) dp(18) else 0
         val pg = pageAt(curPage) ?: return dp(80)
@@ -1491,15 +1558,22 @@ class IslandService : Service() {
             0 -> dp(124)
             2 -> dp(100)
             3 -> dp(124)
-            else -> dp(93) + dp(17) * minOf(3, maxOf(1, pg.item?.lines?.size ?: 1))
+            else -> dp(93) + dp(17) * minOf(3, maxOf(1, pg.item?.lines?.size ?: 1)) +
+                dp(25) * behindItems().size
         }
         return base + extra
     }
 
     private fun bindItem(item: NotifItem) {
         val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(item.time))
+        val pos = notifs.indexOf(item)
+        val count = if (!item.live && notifs.size > 1 && pos >= 0) {
+            "  •  ${pos + 1}/${notifs.size}"
+        } else {
+            ""
+        }
         notifApp?.text =
-            if (item.live) "${item.appName}  •  Ongoing" else "${item.appName}  •  $time"
+            if (item.live) "${item.appName}  •  Ongoing" else "${item.appName}  •  $time$count"
         notifTitle?.text = item.title
         notifText?.text =
             if (item.chrono) chronoText(item) else item.lines.joinToString("\n")
@@ -1521,12 +1595,59 @@ class IslandService : Service() {
         if (item != null) bindItem(item)
         val o = ongoing
         if (pg != null && pg.kind == 3 && o != null) bindAlert(o)
+
+        // Stack: older notifications peeking out behind the current card
+        val behind = behindItems()
+        peekTargets = behind
+        val sr = stackRow
+        for (i in 0 until 2) {
+            val row = sr?.getChildAt(i)
+            if (row == null) continue
+            if (i < behind.size && i < peekIcons.size) {
+                val b = behind[i]
+                val ic = peekIcons[i]
+                val m = b.mono
+                if (m != null) {
+                    ic.setImageBitmap(m)
+                    ic.setColorFilter(Color.WHITE)
+                } else {
+                    ic.setImageBitmap(b.icon)
+                    ic.clearColorFilter()
+                }
+                val head = b.title.ifEmpty { b.lines.firstOrNull() ?: "" }
+                peekTexts[i].text = "${b.appName} • $head"
+                row.visibility = View.VISIBLE
+            } else {
+                row.visibility = View.GONE
+            }
+        }
+
         val extra = if (notifs.isNotEmpty()) dp(18) else 0
         musicCard?.setPadding(dp(18), dp(8), dp(18), dp(8) + extra)
-        notifRow?.setPadding(dp(16), dp(8), dp(16), dp(8) + extra)
+        notifRow?.setPadding(dp(16), dp(8), dp(16), dp(8) + extra + dp(25) * behind.size)
         alertRow?.setPadding(dp(18), dp(10), dp(18), dp(12) + extra)
         buildStrip()
         updateBadges()
+    }
+
+    private fun bringToFront(slot: Int) {
+        val target = peekTargets.getOrNull(slot) ?: return
+        val idx = pages().indexOfFirst { it.item === target }
+        if (idx < 0) return
+        if (replyMode) exitReply()
+        curPage = idx
+        markViewedCurrent()
+        haptic()
+        renderPage()
+        animateHeightTo(pageHeight())
+        renderContent()
+        scheduleCollapse(collapseDelay())
+        val v = notifRow
+        if (v != null) {
+            v.translationX = dp(48).toFloat()
+            v.alpha = 0f
+            v.animate().translationX(0f).alpha(1f).setDuration(200).start()
+        }
     }
 
     // White One UI style status icon (falls back to the coloured app icon)
@@ -1763,6 +1884,23 @@ class IslandService : Service() {
         }
     }
 
+    private fun makePeek(bgHex: String): LinearLayout {
+        val ic = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
+        val tx = smallText(11f, "#D0D4DC", false)
+        peekIcons.add(ic)
+        peekTexts.add(tx)
+        return hbox().apply {
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor(bgHex))
+                cornerRadius = dp(12).toFloat()
+            }
+            setPadding(dp(10), 0, dp(10), 0)
+            visibility = View.GONE
+            addView(ic, lp(dp(14), dp(14)).apply { marginEnd = dp(6) })
+            addView(tx, lp(0, WC, 1f))
+        }
+    }
+
     private fun buildPill() {
         removePill()
         val prefs = getSharedPreferences("island", Context.MODE_PRIVATE)
@@ -1781,6 +1919,14 @@ class IslandService : Service() {
         hideLand = prefs.getBoolean("hide_land", true)
         matchColors = prefs.getBoolean("match_colors", true)
         hideApps = prefs.getStringSet("hide_apps", null)?.toSet() ?: emptySet()
+        edgeOn = prefs.getBoolean("edge_on", true)
+        edgeNotif = prefs.getBoolean("edge_notif", true)
+        edgeCall = prefs.getBoolean("edge_call", true)
+        edgeC1 = prefs.getInt("edge_c1", 0xFF3987FF.toInt())
+        edgeC2 = prefs.getInt("edge_c2", 0xFF55D9FF.toInt())
+        edgeMs = prefs.getInt("edge_ms10", 25) * 100L
+        edgeThick = prefs.getInt("edge_thick", 3)
+        edgeGlow = prefs.getInt("edge_glow", 12)
         val baseColor = prefs.getInt("pill_color", Color.BLACK)
         val alphaPct = prefs.getInt("pill_alpha", 100)
         basePillColor = Color.argb(
@@ -1950,6 +2096,27 @@ class IslandService : Service() {
             addView(inputRow, lp(MP, WC).apply { topMargin = dp(8) })
         }
         notifRow = nRow
+
+        // Stack: two layers peeking out behind the notification card
+        peekIcons.clear()
+        peekTexts.clear()
+        val p1 = makePeek("#22FFFFFF")
+        val p2 = makePeek("#14FFFFFF")
+        p1.setOnClickListener { bringToFront(0) }
+        p2.setOnClickListener { bringToFront(1) }
+        val stackBox = vbox().apply {
+            visibility = View.GONE
+            addView(p1, lp(MP, dp(22)).apply {
+                marginStart = dp(18)
+                marginEnd = dp(18)
+            })
+            addView(p2, lp(MP, dp(22)).apply {
+                topMargin = dp(3)
+                marginStart = dp(30)
+                marginEnd = dp(30)
+            })
+        }
+        stackRow = stackBox
 
         // Music card
         val mArt = artView(0.22f)
@@ -2130,6 +2297,10 @@ class IslandService : Service() {
             addView(qRow, FrameLayout.LayoutParams(MP, MP))
             addView(bRow, FrameLayout.LayoutParams(MP, MP))
             addView(
+                stackBox,
+                FrameLayout.LayoutParams(MP, WC, Gravity.BOTTOM).apply { bottomMargin = dp(22) }
+            )
+            addView(
                 cArt,
                 FrameLayout.LayoutParams(
                     artSize, artSize, Gravity.START or Gravity.CENTER_VERTICAL
@@ -2176,6 +2347,37 @@ class IslandService : Service() {
         params = wlp
 
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+
+        // Edge Lighting window: added first so it sits behind the pill
+        if (edgeOn) {
+            val gv = GlowView(this)
+            glowView = gv
+            glowPad = dp(edgeGlow) + dp(edgeThick) + dp(3)
+            gv.configure(
+                edgeC1, edgeC2,
+                dp(edgeThick).toFloat(), dp(edgeGlow).toFloat(), glowPad.toFloat()
+            )
+            gv.radius = cornerPx
+            gv.visibility = View.INVISIBLE
+            gv.onEnd = { glowActive = false }
+            val gp = WindowManager.LayoutParams(
+                smallW + 2 * glowPad,
+                smallH + 2 * glowPad,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                x = offsetX
+                y = top - glowPad
+            }
+            glowParams = gp
+            wm?.addView(gv, gp)
+        }
+
         wm?.addView(b, wlp)
 
         // Middle strip under the pill: privacy dots and the charging word
@@ -2505,6 +2707,7 @@ class IslandService : Service() {
         val v = box ?: return
         v.invalidateOutline()
         if (v.isAttachedToWindow) wm?.updateViewLayout(v, wlp)
+        updateGlowLayout()
     }
 
     private fun showOnly(which: View?) {
@@ -2571,11 +2774,18 @@ class IslandService : Service() {
         if (frac <= 0.6f) {
             showOnly(null)
             strip?.visibility = View.GONE
+            stackRow?.visibility = View.GONE
             return
         }
 
         strip?.visibility =
             if (event == EVENT_PAGE && notifs.isNotEmpty()) View.VISIBLE else View.GONE
+        stackRow?.visibility =
+            if (event == EVENT_PAGE && kind == 1 && peekTargets.isNotEmpty()) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
 
         when (event) {
             EVENT_PLUG, EVENT_UNPLUG -> {
@@ -2620,132 +2830,3 @@ class IslandService : Service() {
         infoIcon?.glyph = if (charging) GlyphView.BOLT else GlyphView.BATTERY
         infoIcon?.filled = charging
         infoIcon?.tint = if (charging) Color.parseColor("#30D158") else Color.WHITE
-        label?.setTextColor(Color.WHITE)
-        label?.text = if (charging) {
-            "Charging   $level%"
-        } else {
-            val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
-            "$level%   •   $time"
-        }
-        infoRow?.visibility = View.VISIBLE
-    }
-
-    private fun removePill() {
-        handler.removeCallbacks(collapseRunnable)
-        handler.removeCallbacks(longPress)
-        handler.removeCallbacks(fgPoll)
-        animator?.cancel()
-        heightAnim?.cancel()
-        springAnim?.cancel()
-        pressAnim?.cancel()
-        chargeView?.stop()
-        cardEq?.setActive(false)
-        compactEq?.setActive(false)
-        removeSideWindows()
-        box?.let {
-            if (it.isAttachedToWindow) wm?.removeView(it)
-        }
-        badgeBox?.let {
-            if (it.isAttachedToWindow) wm?.removeView(it)
-        }
-        box = null
-        bg = null
-        bgArt = null
-        bgScrim = null
-        infoRow = null
-        infoIcon = null
-        label = null
-        chargeRow = null
-        chargeView = null
-        chargeTitle = null
-        chargeLevel = null
-        chargeSub = null
-        musicCard = null
-        cardArt = null
-        cardTitle = null
-        cardArtist = null
-        cardEq = null
-        playBtn = null
-        compactArt = null
-        compactEq = null
-        compactTimer = null
-        notifRow = null
-        notifIcon = null
-        notifApp = null
-        notifTitle = null
-        notifText = null
-        notifBar = null
-        notifBtnRow = null
-        notifInputRow = null
-        notifInput = null
-        replyBtn = null
-        clearBtn = null
-        alertRow = null
-        alertIcon = null
-        alertSub = null
-        alertName = null
-        alertLeft = null
-        alertRight = null
-        toastRow = null
-        toastIcon = null
-        toastTitle = null
-        toastSub = null
-        quickRow = null
-        qTorch = null
-        qRinger = null
-        barRow = null
-        barIcon = null
-        barText = null
-        barView = null
-        strip = null
-        badgeBox = null
-        dotCam = null
-        dotMic = null
-        chargeBadge = null
-        chargeBadgeText = null
-    }
-
-    override fun onDestroy() {
-        instance = null
-        handler.removeCallbacks(ticker)
-        removePill()
-        clearControllers()
-        controller = null
-        try {
-            msm?.removeOnActiveSessionsChangedListener(sessionsListener)
-        } catch (e: Exception) {
-        }
-        mediaReady = false
-        try {
-            unregisterReceiver(receiver)
-        } catch (e: Exception) {
-        }
-        try {
-            contentResolver.unregisterContentObserver(brightnessObserver)
-        } catch (e: Exception) {
-        }
-        try {
-            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            cm.removePrimaryClipChangedListener(clipListener)
-        } catch (e: Exception) {
-        }
-        try {
-            val cam = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            cam.unregisterAvailabilityCallback(camCallback)
-            cam.unregisterTorchCallback(torchCallback)
-        } catch (e: Exception) {
-        }
-        try {
-            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            am.unregisterAudioRecordingCallback(recCallback)
-        } catch (e: Exception) {
-        }
-        val prefs = getSharedPreferences("island", Context.MODE_PRIVATE)
-        if (prefs.getBoolean("headsup_off", false)) {
-            val ctx = applicationContext
-            Thread { ShizukuHelper.setHeadsUp(ctx, true) }.start()
-        }
-        running = false
-        super.onDestroy()
-    }
-}
