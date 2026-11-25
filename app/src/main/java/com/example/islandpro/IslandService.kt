@@ -763,6 +763,7 @@ class IslandService : Service() {
         if (seen[sbn.key] == sig) return
         if (seen.size > 100) seen.clear()
         seen[sbn.key] = sig
+        NotificationSound.play(this)
 
         val icon = appIcon(sbn.packageName)
         val mono = try {
