@@ -90,6 +90,21 @@ class MainActivity : Activity() {
         }, buttonParams())
         statusCard.addView(row)
         root.addView(statusCard)
+        val edgeCard = card()
+        edgeCard.addView(label("Edge Lighting", 18f, textMain, true))
+        edgeCard.addView(
+            label("Soft glow around Island when something arrives", 12f, textDim, false)
+                .apply { setPadding(0, dp(4), 0, dp(10)) }
+        )
+        edgeCard.addView(
+            actionButton("Edge Lighting settings", true) {
+                startActivity(Intent(this, EdgeLightingActivity::class.java))
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(52)
+            )
+        )
+        root.addView(edgeCard)
 
         // Notification access
         val accessCard = card()
