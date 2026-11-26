@@ -8,6 +8,18 @@ class MusicListener : NotificationListenerService() {
     companion object {
         @Volatile
         var instance: MusicListener? = null
+
+        fun importanceOf(sbn: StatusBarNotification): Int {
+            return try {
+                val l = instance
+                    ?: return android.app.NotificationManager.IMPORTANCE_DEFAULT
+                val r = NotificationListenerService.Ranking()
+                if (l.currentRanking.getRanking(sbn.key, r)) r.importance
+                else android.app.NotificationManager.IMPORTANCE_DEFAULT
+            } catch (e: Exception) {
+                android.app.NotificationManager.IMPORTANCE_DEFAULT
+            }
+        }
     }
 
     override fun onCreate() {
