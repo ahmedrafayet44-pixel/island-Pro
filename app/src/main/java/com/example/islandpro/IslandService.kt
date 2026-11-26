@@ -713,7 +713,33 @@ private val selfCancelled = HashSet<String>()
         }
         return if (out.size > 3) out.subList(out.size - 3, out.size).toList() else out
     }
+private val soundApps = setOf(
+        "com.imo.android.imoim", "com.imo.android.imoimbeta",
+        "com.whatsapp", "com.whatsapp.w4b",
+        "com.facebook.katana", "com.facebook.lite",
+        "com.facebook.orca", "com.facebook.mlite",
+        "com.google.android.apps.messaging", "com.android.mms",
+        "com.samsung.android.messaging", "com.miui.mms",
+        "com.google.android.gm", "com.google.android.apps.gmail",
+        "com.android.email", "com.microsoft.office.outlook",
+        "org.telegram.messenger", "com.viber.voip"
+    )
 
+    private fun shouldPlaySound(
+        sbn: StatusBarNotification,
+        n: Notification,
+        cat: String?
+    ): Boolean {
+        val okApp = soundApps.contains(sbn.packageName) ||
+            cat == Notification.CATEGORY_MESSAGE ||
+            cat == Notification.CATEGORY_EMAIL ||
+            cat == Notification.CATEGORY_SOCIAL
+        if (!okApp) return false
+        if (MusicListener.importanceOf(sbn) < NotificationManager.IMPORTANCE_DEFAULT) return false
+        if ((n.flags and Notification.FLAG_ONGOING_EVENT) != 0) return false
+        if (System.currentTimeMillis() - sbn.postTime > 5000) return false
+        return true
+    }
     fun onNotification(sbn: StatusBarNotification) {
         if (sbn.packageName == packageName) return
         val n = sbn.notification ?: return
@@ -765,9 +791,8 @@ if (seen[sbn.key] == sig) return
 if (seen.size > 100) seen.clear()
 seen[sbn.key] = sig
 
-// Play sound only once for each notification
-if (soundPlayed.add(sbn.key)) {
-    NotificationSound.play(this)
+if (!live && shouldPlaySound(sbn, n, cat)) {
+            NotificationSound.play(this)
 }
 
         val icon = appIcon(sbn.packageName)
